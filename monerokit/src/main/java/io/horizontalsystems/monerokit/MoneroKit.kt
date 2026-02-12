@@ -330,6 +330,10 @@ class MoneroKit(
                 val offset = electrum.passphrase
                 val mnemonic = electrum.mnemonic.joinToString(" ")
                 val newWallet = WalletManager.getInstance().recoveryWallet(newWalletFile, walletPassword, mnemonic, offset, restoreHeight)
+                Log.e("eee", "+++++ WALLET address: ${newWallet.address}")
+                Log.e("eee", "+++++ WALLET spendKey: ${newWallet.secretSpendKey}")
+                Log.e("eee", "+++++ WALLET viewKey: ${newWallet.secretViewKey}")
+                Log.e("eee", "+++++ WALLET native seed: ${newWallet.getSeed("")}")
                 val success = checkAndCloseWallet(newWallet)
 
                 val walletFile = File(walletFolder, walletId)

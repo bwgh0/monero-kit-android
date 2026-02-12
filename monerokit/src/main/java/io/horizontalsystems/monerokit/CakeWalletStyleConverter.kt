@@ -133,7 +133,7 @@ object CakeWalletStyleConverter {
         "lurk", "lush", "luxury", "lymph", "lynx", "lyrics", "macro", "madness",
         "magically", "mailed", "major", "makeup", "malady", "mammal", "maps", "masterful",
         "match", "maul", "maverick", "maximum", "mayor", "maze", "meant", "mechanic",
-        "medicate", "meeting", "megabyte", "melting", "memoir", "men", "merger", "mesh",
+        "medicate", "meeting", "megabyte", "melting", "memoir", "menu", "merger", "mesh",
         "metro", "mews", "mice", "midst", "mighty", "mime", "mirror", "misery",
         "mittens", "mixture", "moat", "mobile", "mocked", "mohawk", "moisture", "molten",
         "moment", "money", "moon", "mops", "morsel", "mostly", "motherly", "mouth",
@@ -249,16 +249,22 @@ object CakeWalletStyleConverter {
 
             // Step 1: Generate BIP39 seed
             val seed = Mnemonic().toSeed(bip39Mnemonic, passphrase)
+            Log.e("eee", "+++++ BIP39 seed bytes (hex): ${seed.joinToString("") { "%02x".format(it) }}")
 
             // Step 2: Derive BIP32 key at m/44'/128'/accountIndex'/0/0
             val hdWallet = HDWallet(seed, 128, HDWallet.Purpose.BIP44)
             val privateKey = hdWallet.privateKey("m/44'/128'/$accountIndex'/0/0").privKey
+            Log.e("eee", "+++++ HD private key (hex): ${privateKey.toString(16)}")
+            Log.e("eee", "+++++ HD private key bytes (hex): ${privateKey.toByteArray32().joinToString("") { "%02x".format(it) }}")
 
             // Step 3: Reduce private key with Ed25519 curve order (Cake Wallet approach)
             val spendKey = reduceECKey(privateKey.toByteArray32())
+            Log.e("eee", "+++++ Spend key (hex, LE): ${spendKey.joinToString("") { "%02x".format(it) }}")
 
             // Step 4: Encode as Monero legacy mnemonic
-            encodeMoneroMnemonic(spendKey)
+            val result = encodeMoneroMnemonic(spendKey)
+            Log.e("eee", "+++++ Electrum mnemonic: ${result.joinToString(" ")}")
+            result
 
         } catch (e: Exception) {
             e.printStackTrace()
