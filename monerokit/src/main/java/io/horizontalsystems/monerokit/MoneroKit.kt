@@ -94,6 +94,7 @@ class MoneroKit(
     private var started = false
     private var savingState = AtomicBoolean(false)
     private var synced = false
+    private var lastStoreHeight: Long = 0
 
     private val _syncStateFlow = MutableStateFlow<SyncState>(SyncState.NotSynced(SyncError.NotStarted))
     val syncStateFlow = _syncStateFlow.asStateFlow()
@@ -215,7 +216,12 @@ class MoneroKit(
     }
 
     private fun stopInternal() {
-        Log.e("eee", "----- kit.stopX($walletId, $kitId) before service.stop()")
+        Log.e("eee", "----- kit.stopX($walletId, $kitId) before saveState+service.stop()")
+        try {
+            saveState()
+        } catch (err: Throwable) {
+            Log.e("eee", "----- kit.stopX($walletId, $kitId) error in saveState()", err)
+        }
         try {
             walletService.stop()
         } catch (err: Throwable) {
@@ -274,6 +280,12 @@ class MoneroKit(
             }
         }
         return list
+    }
+
+    fun createSubaddress(): String? {
+        val wallet = walletService.wallet ?: return null
+        wallet.addSubaddress(accountIndex, "")
+        return wallet.getLastSubaddress(accountIndex)
     }
 
     fun getSubaddress(accountIndex: Int, subaddressIndex: Int): Subaddress? {
@@ -391,19 +403,26 @@ class MoneroKit(
 
         if (wallet.isSynchronized) {
             Log.e("eee", "wallet is synced, first sync = ${!synced}")
-            if (!synced) { // first sync
-                while (savingState.getAndSet(true)) {
-                    Thread.sleep(1000)
-                }
-                walletService.storeWallet()
-                savingState.set(false)
-                synced = true
+            while (savingState.getAndSet(true)) {
+                Thread.sleep(1000)
             }
+            walletService.storeWallet()
+            savingState.set(false)
+            synced = true
         }
 
         if (!wallet.isSynchronized) {
             val daemonHeight: Long = walletService.getDaemonHeight()
             val walletHeight = wallet.getBlockChainHeight()
+
+            // Periodically store wallet state during sync (every 2000 blocks)
+            if (walletHeight - lastStoreHeight >= 2000) {
+                if (!savingState.getAndSet(true)) {
+                    walletService.storeWallet()
+                    savingState.set(false)
+                    lastStoreHeight = walletHeight
+                }
+            }
             val remainingBlocks = daemonHeight - walletHeight
 
             if (firstBlock == 0L) {
