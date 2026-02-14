@@ -79,6 +79,12 @@ class WalletService(private val context: Context) {
         listener?.stop()
         Timber.d("stop wallet: ${wallet?.name}")
         wallet?.let { wallet ->
+            Timber.d("Storing wallet before close")
+            try {
+                wallet.store()
+            } catch (e: Exception) {
+                Timber.w(e, "Failed to store wallet before close")
+            }
             Timber.d("Closing wallet")
             wallet.close()
             Timber.d("Wallet closed")
@@ -211,7 +217,7 @@ class WalletService(private val context: Context) {
 
             val walletFullStatus = wallet.fullStatus
             if (!walletFullStatus.isOk) {
-                observer!!.onRefreshed(wallet, walletFullStatus, false)
+                observer?.onRefreshed(wallet, walletFullStatus, false)
                 return
             }
 
