@@ -1,7 +1,6 @@
 package io.horizontalsystems.monerokit
 
 import android.content.Context
-import android.util.Log
 import io.horizontalsystems.monerokit.data.TxData
 import io.horizontalsystems.monerokit.model.PendingTransaction
 import io.horizontalsystems.monerokit.model.TransactionInfo
@@ -110,10 +109,9 @@ class WalletService(private val context: Context) {
             } else {
                 try {
                     wallet.refreshHistory()
-                    Log.e("eee", "+++++ history in openWallet: ${wallet.history.all.size}, balance: ${wallet.balance}")
                     observer?.onInitialWalletState(Balance(wallet.balance, wallet.unlockedBalance), wallet.history.all)
                 } catch (err: Throwable) {
-                    Log.e("eee", "+++++ error in openWallet onInitialWalletState", err)
+                    Timber.e(err, "error in openWallet onInitialWalletState")
                     Unit
                 }
                 this.wallet = wallet
@@ -163,7 +161,7 @@ class WalletService(private val context: Context) {
         fun stop() {
             Timber.d("WalletListener.stop()")
             val wallet = wallet ?: run {
-                Log.e("eee", "stop() wallet is NULL")
+                Timber.w("stop() wallet is NULL")
                 return
             }
             wallet.pauseRefresh()
@@ -176,7 +174,7 @@ class WalletService(private val context: Context) {
 
         override fun newBlock(height: Long) {
             val wallet = wallet ?: run {
-                Log.e("eee", "newBlock() wallet is NULL")
+                Timber.w("newBlock() wallet is NULL")
                 return
             }
 
@@ -211,7 +209,7 @@ class WalletService(private val context: Context) {
         override fun refreshed() {
             Timber.d("refreshed() updated= %b", updated)
             val wallet = wallet ?: run {
-                Log.e("eee", "refreshed() wallet is NULL")
+                Timber.w("refreshed() wallet is NULL")
                 return
             }
 
@@ -234,7 +232,6 @@ class WalletService(private val context: Context) {
 
     fun createTransaction(txData: TxData) {
         val wallet = wallet ?: run {
-            Log.e("eee", "createTransaction() wallet is NULL")
             throw IllegalStateException("Create Transaction failed: Wallet is NULL")
         }
         Timber.d("CREATE TX for wallet: %s", wallet.name)
@@ -252,7 +249,6 @@ class WalletService(private val context: Context) {
 
     fun sendTransaction(notes: String?) {
         val wallet = wallet ?: run {
-            Log.e("eee", "sendTransaction() wallet is NULL")
             throw IllegalStateException("Send Transaction failed: Wallet is NULL")
         }
 

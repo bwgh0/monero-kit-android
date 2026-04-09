@@ -1,7 +1,6 @@
 package io.horizontalsystems.monerokit
 
 import android.content.Context
-import android.util.Log
 import io.horizontalsystems.monerokit.KitManager.KitState
 import io.horizontalsystems.monerokit.MoneroKit.Companion.MONERO_LEGACY_MNEMONIC_COUNT
 import io.horizontalsystems.monerokit.data.NodeInfo
@@ -142,11 +141,9 @@ class MoneroKit(
 
             var kitState = KitManager.checkAndGetInitialState(kitId)
 
-            Log.e("eee", "++++++ kit.start($walletId, $kitId) initial kitState: $kitState")
             while (kitState == KitState.Waiting) {
                 delay(1000)
                 kitState = KitManager.checkAndGetState(kitId)
-                Log.e("eee", "++++++ kit.start($walletId, $kitId) waiting kitState: $kitState")
             }
 
             if (kitState == KitState.Running) {
@@ -175,9 +172,7 @@ class MoneroKit(
 
     private suspend fun startInternal(): Boolean {
         try {
-            Log.e("eee", "++++++ kit.startX($walletId, $kitId) before createWalletIfNotExists()")
             createWalletIfNotExists()
-            Log.e("eee", "++++++ kit.startX($walletId, $kitId) after createWalletIfNotExists()")
 
             walletService.setObserver(this@MoneroKit)
             val wallet = walletService.openWallet(walletId, "")
@@ -192,7 +187,6 @@ class MoneroKit(
                 NodeInfo.fromString(node)
             }
 
-            Log.e("eee", "++++++ kit.startX($walletId, $kitId) selected node: ${selectedNode?.host}")
             if (selectedNode == null) {
                 _syncStateFlow.update { SyncState.NotSynced(SyncError.InvalidNode("Invalid node")) }
                 return false
@@ -203,7 +197,6 @@ class MoneroKit(
 
             val status = walletService.start(wallet, trustNode)
 
-            Log.e("eee", "++++++kit.startX($walletId, $kitId) status after start: $status")
             if (status == null || !status.isOk) {
                 _syncStateFlow.update { SyncState.NotSynced(SyncError.StartError(status?.toString() ?: "Wallet is NULL")) }
                 return false
@@ -216,18 +209,16 @@ class MoneroKit(
     }
 
     private fun stopInternal() {
-        Log.e("eee", "----- kit.stopX($walletId, $kitId) before saveState+service.stop()")
         try {
             saveState()
         } catch (err: Throwable) {
-            Log.e("eee", "----- kit.stopX($walletId, $kitId) error in saveState()", err)
+            Timber.e(err, "kit.stop($walletId) error in saveState()")
         }
         try {
             walletService.stop()
         } catch (err: Throwable) {
-            Log.e("eee", "----- kit.stopX($walletId, $kitId) error in service.stop()", err)
+            Timber.e(err, "kit.stop($walletId) error in service.stop()")
         }
-        Log.e("eee", "----- kit.stopX($walletId, $kitId) after service.stop()")
     }
 
     fun saveState() {
@@ -241,9 +232,10 @@ class MoneroKit(
     fun send(
         amount: Long,
         address: String,
-        memo: String?
+        memo: String?,
+        sweepAll: Boolean = false
     ) {
-        val txData = buildTxData(amount, address, memo)
+        val txData = buildTxData(amount, address, memo, sweepAll)
 
         walletService.createTransaction(txData)
         walletService.sendTransaction(memo)
@@ -252,10 +244,11 @@ class MoneroKit(
     fun estimateFee(
         amount: Long,
         address: String,
-        memo: String?
+        memo: String?,
+        sweepAll: Boolean = false
     ): Long {
         val wallet = walletService.wallet ?: throw IllegalStateException("Wallet is NULL")
-        val txData = buildTxData(amount, address, memo)
+        val txData = buildTxData(amount, address, memo, sweepAll)
 
         return wallet.estimateTransactionFee(txData)
     }
@@ -306,9 +299,10 @@ class MoneroKit(
     private fun buildTxData(
         amount: Long,
         destination: String,
-        memo: String?
+        memo: String?,
+        sweepAll: Boolean = false
     ) = TxData().apply {
-        this.amount = if (amount == balance.unlocked) Wallet.SWEEP_ALL else amount
+        this.amount = if (sweepAll) Wallet.SWEEP_ALL else amount
         this.destination = destination
         mixin = MIXIN
         priority = PendingTransaction.Priority.Priority_Medium
@@ -342,10 +336,6 @@ class MoneroKit(
                 val offset = electrum.passphrase
                 val mnemonic = electrum.mnemonic.joinToString(" ")
                 val newWallet = WalletManager.getInstance().recoveryWallet(newWalletFile, walletPassword, mnemonic, offset, restoreHeight)
-                Log.e("eee", "+++++ WALLET address: ${newWallet.address}")
-                Log.e("eee", "+++++ WALLET spendKey: ${newWallet.secretSpendKey}")
-                Log.e("eee", "+++++ WALLET viewKey: ${newWallet.secretViewKey}")
-                Log.e("eee", "+++++ WALLET native seed: ${newWallet.getSeed("")}")
                 val success = checkAndCloseWallet(newWallet)
 
                 val walletFile = File(walletFolder, walletId)
@@ -383,7 +373,7 @@ class MoneroKit(
     private var firstBlock: Long = 0
 
     override fun onRefreshed(wallet: Wallet, fullStatus: Wallet.Status, full: Boolean): Boolean {
-        Log.e("eee", "observer.onRefreshed()\n - wallet: ${fullStatus}\n - full: $full")
+        Timber.d("onRefreshed() status=%s full=%b", fullStatus, full)
 
         if (!fullStatus.isOk) {
             _syncStateFlow.update {
@@ -393,7 +383,6 @@ class MoneroKit(
         }
 
         val historyAll: List<TransactionInfo?>? = wallet.history.all
-        Log.e("eee", "historyAll: ${historyAll?.count()}")
 
         if (historyAll != null) {
             _allTransactionsFlow.update {
@@ -402,7 +391,6 @@ class MoneroKit(
         }
 
         if (wallet.isSynchronized) {
-            Log.e("eee", "wallet is synced, first sync = ${!synced}")
             while (savingState.getAndSet(true)) {
                 Thread.sleep(1000)
             }
@@ -442,8 +430,6 @@ class MoneroKit(
             } else {
                 1.0
             }
-
-            Log.e("eee", "emit syncing: $progress, current: ${_syncStateFlow.value.description}")
 
             _syncStateFlow.update {
                 SyncState.Syncing(progress, remainingBlocks)
@@ -537,8 +523,6 @@ class MoneroKit(
         ): MoneroKit {
             val walletService = WalletService(context)
             val restoreHeight = getHeight(restoreDateOrHeight)
-
-            Log.e("eee", "computed restoreHeight = $restoreHeight")
 
             NetCipherHelper.createInstance(context)
 

@@ -1,7 +1,6 @@
 package io.horizontalsystems.monerokit.sample
 
 import android.app.Application
-import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -55,7 +54,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun updateSyncState(syncState: SyncState) {
-        Log.e("eee", "viewmodel syncState: $syncState")
         this.syncState = syncState
 
         if (syncState is SyncState.Synced) {
@@ -108,8 +106,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteWallet() {
         viewModelScope.launch {
-            val result = MoneroKit.deleteWallet(App.instance, App.walletId)
-            Log.e("eee", "deleteWallet: $result")
+            MoneroKit.deleteWallet(App.instance, App.walletId)
         }
     }
 
