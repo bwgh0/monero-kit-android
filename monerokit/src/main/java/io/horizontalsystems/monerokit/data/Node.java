@@ -261,7 +261,12 @@ public class Node {
     }
 
     public String getAddress() {
-        return HostAndPort.fromParts(getHostAddress(), rpcPort).toString();
+        String hostPort = HostAndPort.fromParts(getHostAddress(), rpcPort).toString();
+        // Port 443 implies SSL — the C++ wallet2 needs https:// prefix for TLS connections
+        if (rpcPort == 443) {
+            return "https://" + hostPort;
+        }
+        return hostPort;
     }
 
     public String getHostAddress() {
