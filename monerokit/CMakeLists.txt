@@ -6,6 +6,10 @@ add_library( monerujo
              SHARED
              src/main/cpp/monerujo.cpp )
 
+target_link_options(monerujo PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384")
+
 set(EXTERNAL_LIBS_DIR ${CMAKE_SOURCE_DIR}/external-libs)
 
 ############
