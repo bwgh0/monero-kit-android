@@ -18,6 +18,16 @@
 #include "monerujo.h"
 #include "wallet2_api.h"
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include <cerrno>
+#include <dirent.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 
 #ifdef __cplusplus
 extern "C"
@@ -1110,6 +1120,110 @@ Java_io_horizontalsystems_monerokit_model_Wallet_setOffline(JNIEnv *env, jobject
                                                            jboolean offline) {
     Monero::Wallet *wallet = getHandle<Monero::Wallet>(env, instance);
     wallet->setOffline(offline);
+}
+
+static bool sameAddress(const sockaddr_storage &peer, const sockaddr_storage &node) {
+    if (peer.ss_family == AF_INET && node.ss_family == AF_INET) {
+        return reinterpret_cast<const sockaddr_in &>(peer).sin_addr.s_addr ==
+               reinterpret_cast<const sockaddr_in &>(node).sin_addr.s_addr;
+    }
+    if (peer.ss_family == AF_INET6 && node.ss_family == AF_INET6) {
+        return memcmp(&reinterpret_cast<const sockaddr_in6 &>(peer).sin6_addr,
+                      &reinterpret_cast<const sockaddr_in6 &>(node).sin6_addr,
+                      sizeof(in6_addr)) == 0;
+    }
+    // a dual-stack socket reports an IPv4 peer as ::ffff:a.b.c.d
+    if (peer.ss_family == AF_INET6 && node.ss_family == AF_INET) {
+        const in6_addr &mapped = reinterpret_cast<const sockaddr_in6 &>(peer).sin6_addr;
+        return IN6_IS_ADDR_V4MAPPED(&mapped) &&
+               memcmp(&mapped.s6_addr[12],
+                      &reinterpret_cast<const sockaddr_in &>(node).sin_addr, 4) == 0;
+    }
+    return false;
+}
+
+static uint16_t peerPort(const sockaddr_storage &peer) {
+    if (peer.ss_family == AF_INET) return ntohs(reinterpret_cast<const sockaddr_in &>(peer).sin_port);
+    if (peer.ss_family == AF_INET6) return ntohs(reinterpret_cast<const sockaddr_in6 &>(peer).sin6_port);
+    return 0;
+}
+
+// A TCP socket whose connect() has not completed. It has no peer address to match yet.
+static bool isConnecting(int fd) {
+    sockaddr_storage local{};
+    socklen_t localLength = sizeof(local);
+    if (getsockname(fd, reinterpret_cast<sockaddr *>(&local), &localLength) != 0) return false;
+    if (local.ss_family != AF_INET && local.ss_family != AF_INET6) return false;
+    tcp_info info{};
+    socklen_t infoLength = sizeof(info);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &infoLength) != 0) return false;
+    return info.tcpi_state == TCP_SYN_SENT;
+}
+
+// Shuts down every TCP connection of this process to host:port and returns how many it cut.
+// wallet2 holds its daemon RPC mutex for the whole of a request, up to its 3.5 min rpc_timeout, and has
+// no way to cancel one: a request stuck on a dead connection blocks setOffline(), close() and every other
+// RPC of that wallet. shutdown() wakes the blocked read with EOF, so the request fails now.
+// With connecting set, sockets still waiting for a SYN-ACK are cut as well (a node that drops packets);
+// their destination is unknown, so only callers that are tearing a wallet down pass it.
+// When the host does not resolve, only a non-web port is matched on its own.
+JNIEXPORT jint JNICALL
+Java_io_horizontalsystems_monerokit_util_NodeSockets_abortJ(JNIEnv *env, jclass clazz,
+                                                            jstring host, jint port,
+                                                            jboolean connecting) {
+    const char *_host = env->GetStringUTFChars(host, nullptr);
+    if (_host == nullptr) return -1;
+    std::string hostName(_host);
+    env->ReleaseStringUTFChars(host, _host);
+
+    std::vector<sockaddr_storage> nodeAddresses;
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo *resolved = nullptr;
+    if (getaddrinfo(hostName.c_str(), nullptr, &hints, &resolved) == 0) {
+        for (addrinfo *ai = resolved; ai != nullptr; ai = ai->ai_next) {
+            if (ai->ai_addrlen > sizeof(sockaddr_storage)) continue;
+            sockaddr_storage address{};
+            memcpy(&address, ai->ai_addr, ai->ai_addrlen);
+            nodeAddresses.push_back(address);
+        }
+        freeaddrinfo(resolved);
+    }
+    // unresolved: a Monero RPC port alone is specific enough, a web port is not
+    bool matchEstablished = !nodeAddresses.empty() || (port != 80 && port != 443);
+    if (!matchEstablished) LOGW("abortJ: %s did not resolve, not matching port %d alone", hostName.c_str(), port);
+
+    DIR *fds = opendir("/proc/self/fd");
+    if (fds == nullptr) return -1;
+    int cut = 0;
+    while (dirent *entry = readdir(fds)) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        int fd = atoi(entry->d_name);
+        if (fd == dirfd(fds)) continue;
+        struct stat info{};
+        if (fstat(fd, &info) != 0 || !S_ISSOCK(info.st_mode)) continue;
+        int type = 0;
+        socklen_t typeLength = sizeof(type);
+        if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &typeLength) != 0 || type != SOCK_STREAM) continue;
+        sockaddr_storage peer{};
+        socklen_t peerLength = sizeof(peer);
+        if (getpeername(fd, reinterpret_cast<sockaddr *>(&peer), &peerLength) != 0) {
+            if (connecting && errno == ENOTCONN && isConnecting(fd) && shutdown(fd, SHUT_RDWR) == 0) cut++;
+            continue;
+        }
+        if (!matchEstablished || peerPort(peer) != port) continue;
+        bool match = nodeAddresses.empty();
+        for (const sockaddr_storage &node : nodeAddresses) {
+            if (sameAddress(peer, node)) {
+                match = true;
+                break;
+            }
+        }
+        if (match && shutdown(fd, SHUT_RDWR) == 0) cut++;
+    }
+    closedir(fds);
+    return cut;
 }
 
 JNIEXPORT jboolean JNICALL

@@ -10,7 +10,9 @@ import io.horizontalsystems.monerokit.model.WalletListener
 import io.horizontalsystems.monerokit.model.WalletManager
 import io.horizontalsystems.monerokit.util.Helper
 import io.horizontalsystems.monerokit.util.NetCipherHelper
+import io.horizontalsystems.monerokit.util.NodeSockets
 import timber.log.Timber
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -19,10 +21,19 @@ class WalletService(private val context: Context) {
     companion object {
         var running: Boolean = false
         private const val STATUS_UPDATE_INTERVAL = 120_000L // 120s
+
+        // An RPC in flight past this long is presumed stuck and its connection is cut.
+        private const val QUIESCE_GRACE_MS = 750L
+        // What stop() still waits after the cut for store + close before handing them to the background.
+        private const val CLOSE_GRACE_MS = 2_000L
     }
 
     private var observer: Observer? = null
     private var listener: MyWalletListener? = null
+
+    // The node wallet2 was initialised with (WalletManager.getDaemonAddress(): resolved ip:port).
+    @Volatile
+    private var daemonAddress: String? = null
 
     // Set while quiesceRefresh() winds a pass down; its callbacks would report an interrupted pass as synced.
     @Volatile
@@ -81,7 +92,12 @@ class WalletService(private val context: Context) {
     /** Stores from outside the refresh thread: holds the refresh thread at rest for the write, then resumes it. */
     fun storeWalletSafely(): Boolean {
         val wallet = wallet ?: return false
-        quiesceRefresh(wallet)
+        val rescue = daemonAddress?.let { cutConnectionAfter(it, QUIESCE_GRACE_MS) }
+        try {
+            quiesceRefresh(wallet)
+        } finally {
+            rescue?.interrupt()
+        }
         return try {
             wallet.store().also { stored ->
                 if (!stored) Timber.w("Wallet store failed: %s", wallet.status.errorString)
@@ -93,6 +109,27 @@ class WalletService(private val context: Context) {
         }
     }
 
+    /** Cuts every connection to the node, including connects still waiting for an answer. */
+    fun cutNodeConnections(): Int {
+        val daemon = daemonAddress ?: return 0
+        return NodeSockets.abort(daemon, connecting = true).also { Timber.d("cut %d node connection(s)", it) }
+    }
+
+    /**
+     * Drops the connection to the node so the next RPC dials a fresh one. A request stuck on a dead
+     * connection (network change, NAT timeout, a node that stopped answering) fails now instead of after
+     * wallet2's 3.5 min timeout, and the refresh pass retries on the new connection.
+     */
+    fun recycleConnection(): Int {
+        val daemon = daemonAddress ?: return 0
+        return NodeSockets.abort(daemon).also { Timber.d("recycled %d node connection(s)", it) }
+    }
+
+    /**
+     * Returns once the wallet is closed, or after at most QUIESCE_GRACE_MS + CLOSE_GRACE_MS: a close still
+     * running then finishes in the background, and [WalletClosings] holds back a reopen of the same wallet
+     * until it is done. The caller (a wallet switch, a node change) is never held for a stuck RPC.
+     */
     fun stop() {
         Timber.d("stop() listener: $listener")
         setObserver(null)
@@ -104,6 +141,32 @@ class WalletService(private val context: Context) {
             current
         }
         if (closing != null) {
+            val name = closing.name
+            val daemon = daemonAddress
+            val closed = WalletClosings.begin(name)
+            thread(name = "wallet-close") {
+                try {
+                    closeWallet(closing)
+                } finally {
+                    quiescing = false
+                    WalletClosings.end(name, closed)
+                }
+            }
+            if (!closed.await(QUIESCE_GRACE_MS, TimeUnit.MILLISECONDS)) {
+                // An RPC in flight holds wallet2's daemon mutex, so quiesceRefresh() waits for the node to
+                // answer: on a dead connection that is wallet2's 3.5 min timeout.
+                val cut = daemon?.let { NodeSockets.abort(it, connecting = true) } ?: 0
+                Timber.w("stop: %s busy after %d ms, cut %d node connection(s)", name, QUIESCE_GRACE_MS, cut)
+                if (!closed.await(CLOSE_GRACE_MS, TimeUnit.MILLISECONDS)) {
+                    Timber.w("stop: %s still closing, finishing in the background", name)
+                }
+            }
+        }
+        running = false
+    }
+
+    private fun closeWallet(closing: Wallet) {
+        try {
             // Not under the monitor: a callback already inside onRefreshed() may still need it for
             // storeWallet(), and quiesceRefresh() waits for that callback's pass to end.
             quiesceRefresh(closing)
@@ -117,9 +180,19 @@ class WalletService(private val context: Context) {
             Timber.d("Closing wallet")
             closing.close()
             Timber.d("Wallet closed")
+        } catch (e: Throwable) {
+            Timber.e(e, "Closing wallet failed")
         }
-        quiescing = false
-        running = false
+    }
+
+    private fun cutConnectionAfter(daemon: String, delayMs: Long): Thread = thread(name = "wallet-rescue") {
+        try {
+            Thread.sleep(delayMs)
+        } catch (_: InterruptedException) {
+            return@thread
+        }
+        val cut = NodeSockets.abort(daemon, connecting = true)
+        Timber.w("refresh busy after %d ms, cut %d node connection(s)", delayMs, cut)
     }
 
     /**
@@ -184,7 +257,8 @@ class WalletService(private val context: Context) {
     }
 
     private fun initWallet(wallet: Wallet, trustNode: Boolean) {
-        Timber.d("Using daemon %s", WalletManager.getInstance().daemonAddress)
+        daemonAddress = WalletManager.getInstance().daemonAddress
+        Timber.d("Using daemon %s", daemonAddress)
         wallet.init(0)
         wallet.setTrustedDaemon(trustNode)
         wallet.setProxy(NetCipherHelper.getProxy())
