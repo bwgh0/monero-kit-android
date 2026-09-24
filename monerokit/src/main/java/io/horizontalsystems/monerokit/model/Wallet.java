@@ -352,6 +352,11 @@ public class Wallet {
 
     public native void pauseRefresh();
 
+    // Ends the block loop of a refresh pass in progress; the refresh thread itself keeps running.
+    public native void interruptRefresh();
+
+    public native void setOffline(boolean offline);
+
     public native boolean refresh();
 
     public native void refreshAsync();
