@@ -11,6 +11,8 @@ import io.horizontalsystems.monerokit.model.WalletManager
 import io.horizontalsystems.monerokit.util.Helper
 import io.horizontalsystems.monerokit.util.NetCipherHelper
 import timber.log.Timber
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 
 class WalletService(private val context: Context) {
 
@@ -21,6 +23,10 @@ class WalletService(private val context: Context) {
 
     private var observer: Observer? = null
     private var listener: MyWalletListener? = null
+
+    // Set while quiesceRefresh() winds a pass down; its callbacks would report an interrupted pass as synced.
+    @Volatile
+    private var quiescing = false
 
     private var daemonHeight: Long = 0
     private var lastDaemonStatusUpdate: Long = 0
@@ -65,32 +71,86 @@ class WalletService(private val context: Context) {
         return walletStatus
     }
 
+    // For observer callbacks, which run on wallet2's refresh thread; other callers use storeWalletSafely().
     @Synchronized
     fun storeWallet() {
         val success = wallet?.store()
         Timber.d("Wallet stored: $success")
     }
 
-    @Synchronized
+    /** Stores from outside the refresh thread: holds the refresh thread at rest for the write, then resumes it. */
+    fun storeWalletSafely(): Boolean {
+        val wallet = wallet ?: return false
+        quiesceRefresh(wallet)
+        return try {
+            wallet.store().also { stored ->
+                if (!stored) Timber.w("Wallet store failed: %s", wallet.status.errorString)
+            }
+        } finally {
+            quiescing = false
+            wallet.setOffline(false)
+            wallet.startRefresh()
+        }
+    }
+
     fun stop() {
         Timber.d("stop() listener: $listener")
         setObserver(null)
-        listener?.stop()
-        Timber.d("stop wallet: ${wallet?.name}")
-        wallet?.let { wallet ->
+        // Unpublish first: getters and late wallet2 callbacks see null instead of a wallet being closed.
+        val closing = synchronized(this) {
+            val current = this.wallet
+            this.wallet = null
+            listener = null
+            current
+        }
+        if (closing != null) {
+            // Not under the monitor: a callback already inside onRefreshed() may still need it for
+            // storeWallet(), and quiesceRefresh() waits for that callback's pass to end.
+            quiesceRefresh(closing)
             Timber.d("Storing wallet before close")
             try {
-                wallet.store()
+                if (!closing.store()) Timber.w("Wallet store failed: %s", closing.status.errorString)
             } catch (e: Exception) {
                 Timber.w(e, "Failed to store wallet before close")
             }
+            closing.setListener(null)
             Timber.d("Closing wallet")
-            wallet.close()
+            closing.close()
             Timber.d("Wallet closed")
         }
-        wallet = null
-        listener = null
+        quiescing = false
         running = false
+    }
+
+    /**
+     * Brings wallet2's refresh thread to rest so the cache can be written. pauseRefresh() alone only keeps
+     * new passes from starting: a pass already running keeps appending to the block hash chain, and a
+     * store() racing it serializes that deque mid-reallocation (SIGSEGV in wallet2::store on wallet switch).
+     * Offline mode fails the running pass's next RPC, interruptRefresh() ends its block loop, and refresh()
+     * returns only after that pass has exited, since both take WalletImpl's refresh mutex. Offline, our own
+     * refresh() pass skips the network and returns at once.
+     */
+    private fun quiesceRefresh(wallet: Wallet) {
+        val startedAt = System.currentTimeMillis()
+        quiescing = true
+        wallet.pauseRefresh()
+        // wallet2's refresh() re-arms its stop flag when a pass begins, so one interrupt can be lost.
+        val done = AtomicBoolean(false)
+        val interrupter = thread(name = "wallet-quiesce") {
+            while (!done.get()) {
+                wallet.interruptRefresh()
+                Thread.sleep(50)
+            }
+        }
+        try {
+            // waits out an RPC in flight (wallet2's daemon RPC mutex), then drops the connection
+            wallet.setOffline(true)
+            wallet.refresh()
+        } finally {
+            done.set(true)
+            interrupter.join()
+        }
+        Timber.d("refresh at rest after %d ms", System.currentTimeMillis() - startedAt)
     }
 
     fun openWallet(walletName: String, walletPassword: String): Wallet? {
@@ -158,21 +218,12 @@ class WalletService(private val context: Context) {
             wallet.startRefresh()
         }
 
-        fun stop() {
-            Timber.d("WalletListener.stop()")
-            val wallet = wallet ?: run {
-                Timber.w("stop() wallet is NULL")
-                return
-            }
-            wallet.pauseRefresh()
-            wallet.setListener(null)
-        }
-
         override fun moneySpent(txId: String, amount: Long) = Timber.d("moneySpent() $amount @ $txId")
         override fun moneyReceived(txId: String, amount: Long) = Timber.d("moneyReceived() $amount @ $txId")
         override fun unconfirmedMoneyReceived(txId: String, amount: Long) = Timber.d("unconfirmedMoneyReceived() $amount @ $txId")
 
         override fun newBlock(height: Long) {
+            if (quiescing) return
             val wallet = wallet ?: run {
                 Timber.w("newBlock() wallet is NULL")
                 return
@@ -208,6 +259,7 @@ class WalletService(private val context: Context) {
 
         override fun refreshed() {
             Timber.d("refreshed() updated= %b", updated)
+            if (quiescing) return
             val wallet = wallet ?: run {
                 Timber.w("refreshed() wallet is NULL")
                 return
@@ -271,11 +323,9 @@ class WalletService(private val context: Context) {
                 wallet.setUserNote(txId, notes)
             }
 
-            val rc = wallet.store()
+            // commit() restarts refresh, so a pass may already be running
+            val rc = storeWalletSafely()
             Timber.d("wallet stored: %s with rc=%b", wallet.name, rc)
-            if (!rc) {
-                Timber.w("Wallet store failed: %s", wallet.status.errorString)
-            }
             listener?.updated = true
         } else {
             val error = pendingTransaction.getErrorString()

@@ -1098,6 +1098,20 @@ Java_io_horizontalsystems_monerokit_model_Wallet_pauseRefresh(JNIEnv *env, jobje
     wallet->pauseRefresh();
 }
 
+// wallet2::stop(): ends the block loop of a refresh pass in progress; the refresh thread keeps running
+JNIEXPORT void JNICALL
+Java_io_horizontalsystems_monerokit_model_Wallet_interruptRefresh(JNIEnv *env, jobject instance) {
+    Monero::Wallet *wallet = getHandle<Monero::Wallet>(env, instance);
+    wallet->stop();
+}
+
+JNIEXPORT void JNICALL
+Java_io_horizontalsystems_monerokit_model_Wallet_setOffline(JNIEnv *env, jobject instance,
+                                                           jboolean offline) {
+    Monero::Wallet *wallet = getHandle<Monero::Wallet>(env, instance);
+    wallet->setOffline(offline);
+}
+
 JNIEXPORT jboolean JNICALL
 Java_io_horizontalsystems_monerokit_model_Wallet_refresh(JNIEnv *env, jobject instance) {
     Monero::Wallet *wallet = getHandle<Monero::Wallet>(env, instance);

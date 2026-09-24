@@ -162,7 +162,6 @@ class MoneroKit(
                 return
             }
 
-            delay(1000)
             stopInternal()
             KitManager.removeRunning(kitId)
 
@@ -209,11 +208,7 @@ class MoneroKit(
     }
 
     private fun stopInternal() {
-        try {
-            saveState()
-        } catch (err: Throwable) {
-            Timber.e(err, "kit.stop($walletId) error in saveState()")
-        }
+        // service.stop() stores the cache once the refresh thread is at rest
         try {
             walletService.stop()
         } catch (err: Throwable) {
@@ -221,12 +216,10 @@ class MoneroKit(
         }
     }
 
+    // Must not take savingState: onRefreshed() spins on it from inside the refresh pass that
+    // storeWalletSafely() waits out, so holding it here would deadlock.
     fun saveState() {
-        if (savingState.getAndSet(true)) return
-
-        walletService.storeWallet()
-
-        savingState.set(false)
+        walletService.storeWalletSafely()
     }
 
     fun send(
@@ -442,10 +435,10 @@ class MoneroKit(
 
         _lastBlockUpdatedFlow.tryEmit(Unit)
 
+        // The callback's own wallet: service.stop() clears walletService.wallet while a pass may
+        // still be reporting, which would publish a zero balance for this wallet.
         _balanceFlow.update {
-            walletService.wallet.let { wallet ->
-                Balance(wallet?.balance ?: 0L, wallet?.unlockedBalance ?: 0L)
-            }
+            Balance(wallet.balance, wallet.unlockedBalance)
         }
 
         return true
