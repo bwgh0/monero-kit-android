@@ -73,6 +73,9 @@ object KitManager {
         if (runningKitId == kitId) {
             runningKitId = waitingKitId
             waitingKitId = null
+        } else if (waitingKitId == kitId) {
+            // stopped before it ever ran: never promote it into the running slot
+            waitingKitId = null
         }
     }
 }
@@ -91,6 +94,10 @@ class MoneroKit(
     private val accountIndex = 0
     private val startStopMutex = Mutex()
     private var started = false
+
+    // Set by abandonStart() for the start in progress, which then gives up; the next start() clears it.
+    @Volatile
+    private var stopRequested = false
     private var savingState = AtomicBoolean(false)
     private var synced = false
     private var lastStoreHeight: Long = 0
@@ -125,6 +132,10 @@ class MoneroKit(
     val balance: Balance
         get() = _balanceFlow.value
 
+    /** False after a start that failed, was abandoned, or has not run yet. */
+    val isStarted: Boolean
+        get() = started
+
     val lastBlockHeight: Long?
         get() = if (walletService.getConnectionStatus() == ConnectionStatus_Connected)
             walletService.getDaemonHeight()
@@ -134,6 +145,7 @@ class MoneroKit(
     suspend fun start() {
         startStopMutex.withLock {
             if (started) return
+            stopRequested = false
 
             _syncStateFlow.update {
                 SyncState.Connecting(true)
@@ -141,7 +153,7 @@ class MoneroKit(
 
             var kitState = KitManager.checkAndGetInitialState(kitId)
 
-            while (kitState == KitState.Waiting) {
+            while (kitState == KitState.Waiting && !stopRequested) {
                 delay(1000)
                 kitState = KitManager.checkAndGetState(kitId)
             }
@@ -156,21 +168,47 @@ class MoneroKit(
     }
 
     suspend fun stop() {
+        abandonStart()
         startStopMutex.withLock {
-            if (!started) {
+            try {
+                if (!started) {
+                    KitManager.removeRunning(kitId)
+                    return
+                }
+
+                stopInternal()
                 KitManager.removeRunning(kitId)
-                return
+
+                started = false
+            } finally {
+                stopRequested = false
             }
-
-            stopInternal()
-            KitManager.removeRunning(kitId)
-
-            started = false
         }
+    }
+
+    /**
+     * The caller has moved on (another wallet tapped, the node changed) and this kit will be stopped: make
+     * a start in progress give up now. A start holds the mutex through wallet2's first contact with the
+     * node, a connection check that waits up to 20 s on a node that never answers, so that connection is
+     * cut. Scans this process's sockets: keep it off the main thread.
+     */
+    fun abandonStart() {
+        if (!startStopMutex.isLocked || started) return
+        stopRequested = true
+        walletService.cutNodeConnections()
     }
 
     private suspend fun startInternal(): Boolean {
         try {
+            // A close of this same wallet may still be finishing in the background (WalletService.stop()).
+            // A stop() arriving meanwhile must not queue behind that wait: the start gives way to it.
+            if (!WalletClosings.awaitSuspending(walletId, REOPEN_WAIT_MS) { stopRequested }) {
+                if (!stopRequested) {
+                    _syncStateFlow.update { SyncState.NotSynced(SyncError.StartError("Wallet is still closing")) }
+                }
+                return false
+            }
+
             createWalletIfNotExists()
 
             walletService.setObserver(this@MoneroKit)
@@ -188,6 +226,11 @@ class MoneroKit(
 
             if (selectedNode == null) {
                 _syncStateFlow.update { SyncState.NotSynced(SyncError.InvalidNode("Invalid node")) }
+                walletService.stop()
+                return false
+            }
+            if (stopRequested) {
+                walletService.stop()
                 return false
             }
 
@@ -197,12 +240,20 @@ class MoneroKit(
             val status = walletService.start(wallet, trustNode)
 
             if (status == null || !status.isOk) {
-                _syncStateFlow.update { SyncState.NotSynced(SyncError.StartError(status?.toString() ?: "Wallet is NULL")) }
+                // an abandoned start failed because its connection was cut, not because of the node
+                if (!stopRequested) {
+                    _syncStateFlow.update { SyncState.NotSynced(SyncError.StartError(status?.toString() ?: "Wallet is NULL")) }
+                }
                 return false
             }
             return true
         } catch (ex: Exception) {
-            _syncStateFlow.update { SyncState.NotSynced(SyncError.StartError(ex.message ?: ex.javaClass.simpleName)) }
+            if (!stopRequested) {
+                _syncStateFlow.update { SyncState.NotSynced(SyncError.StartError(ex.message ?: ex.javaClass.simpleName)) }
+            }
+            // A wallet left open keeps its keys file locked: the next open of it would fail as "Invalid
+            // wallet", which the app treats as a damaged cache and rebuilds from the seed.
+            walletService.stop()
             return false
         }
     }
@@ -220,6 +271,15 @@ class MoneroKit(
     // storeWalletSafely() waits out, so holding it here would deadlock.
     fun saveState() {
         walletService.storeWalletSafely()
+    }
+
+    /**
+     * Drops the node connection so the next RPC dials a fresh one. Call after a network change or a long
+     * stay in the background: a request stuck on a dead connection otherwise stalls sync for up to
+     * wallet2's 3.5 min RPC timeout. Scans this process's sockets: keep it off the main thread.
+     */
+    fun recycleConnection() {
+        if (started) walletService.recycleConnection()
     }
 
     fun send(
@@ -495,6 +555,9 @@ class MoneroKit(
         const val MIXIN: Int = 0
         const val MONERO_LEGACY_MNEMONIC_COUNT = 25
 
+        // wallet2's 3.5 min RPC timeout bounds a close left in the background, plus store/close headroom
+        private const val REOPEN_WAIT_MS = 240_000L
+
         fun getInstance(
             context: Context,
             seed: Seed.Bip39,
@@ -610,6 +673,10 @@ class MoneroKit(
         }
 
         fun deleteWallet(context: Context, walletId: String): Boolean {
+            // A close still in progress would write the cache back after the delete.
+            if (!WalletClosings.await(walletId, REOPEN_WAIT_MS)) {
+                Timber.w("deleteWallet: %s is still closing", walletId)
+            }
             val walletFile: File = Helper.getWalletFile(context, walletId)
 
             return deleteWallet(walletFile)
