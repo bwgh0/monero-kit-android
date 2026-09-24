@@ -1010,6 +1010,123 @@ Java_io_horizontalsystems_monerokit_util_KeyStoreHelper_slowHash(JNIEnv *env, jc
     return result;
 }
 
+static void sha256StateBytes(const SHA256_CTX &ctx, unsigned char out[32]) {
+    for (int i = 0; i < 8; i++) {
+        out[4 * i] = static_cast<unsigned char>(ctx.h[i] >> 24);
+        out[4 * i + 1] = static_cast<unsigned char>(ctx.h[i] >> 16);
+        out[4 * i + 2] = static_cast<unsigned char>(ctx.h[i] >> 8);
+        out[4 * i + 3] = static_cast<unsigned char>(ctx.h[i]);
+    }
+}
+
+// PBKDF2-HMAC-SHA256 (RFC 8018). Every round after the first is two SHA-256 compressions from
+// the saved inner/outer key states, with no allocation; OpenSSL's SHA-256 core uses the CPU's
+// SHA-256 instructions. PKCS5_PBKDF2_HMAC in this OpenSSL (3.0) re-initialises an HMAC context
+// every round and measured several times slower for the same output.
+static void pbkdf2HmacSha256(const unsigned char *pass, size_t passLen,
+                             const unsigned char *salt, size_t saltLen,
+                             uint32_t iterations, unsigned char *out, size_t outLen) {
+    unsigned char key[64] = {0};
+    unsigned char pad[64];
+    unsigned char block[64] = {0};
+    unsigned char u[32];
+    unsigned char t[32];
+    unsigned char counter[4];
+    SHA256_CTX inner, outer, ctx;
+
+    if (passLen > sizeof(key)) {
+        SHA256_Init(&ctx);
+        SHA256_Update(&ctx, pass, passLen);
+        SHA256_Final(key, &ctx);
+    } else if (passLen > 0) {
+        memcpy(key, pass, passLen);
+    }
+    for (size_t i = 0; i < sizeof(pad); i++) pad[i] = key[i] ^ 0x36;
+    SHA256_Init(&inner);
+    SHA256_Update(&inner, pad, sizeof(pad));
+    for (size_t i = 0; i < sizeof(pad); i++) pad[i] = key[i] ^ 0x5c;
+    SHA256_Init(&outer);
+    SHA256_Update(&outer, pad, sizeof(pad));
+
+    // later rounds hash a 32-byte message after the 64-byte key block: one padded block
+    block[32] = 0x80;
+    block[62] = 0x03; // message length (64 + 32) * 8 = 768 bits, big endian
+
+    for (uint32_t index = 1; outLen > 0; index++) {
+        counter[0] = static_cast<unsigned char>(index >> 24);
+        counter[1] = static_cast<unsigned char>(index >> 16);
+        counter[2] = static_cast<unsigned char>(index >> 8);
+        counter[3] = static_cast<unsigned char>(index);
+
+        // U1 = HMAC(P, S || INT(index))
+        ctx = inner;
+        if (saltLen > 0) SHA256_Update(&ctx, salt, saltLen);
+        SHA256_Update(&ctx, counter, sizeof(counter));
+        SHA256_Final(u, &ctx);
+        ctx = outer;
+        SHA256_Update(&ctx, u, sizeof(u));
+        SHA256_Final(u, &ctx);
+        memcpy(t, u, sizeof(t));
+
+        // U_j = HMAC(P, U_j-1); T = U1 ^ U2 ^ ... ^ Uc
+        for (uint32_t round = 1; round < iterations; round++) {
+            memcpy(block, u, sizeof(u));
+            ctx = inner;
+            SHA256_Transform(&ctx, block);
+            sha256StateBytes(ctx, block); // inner digest becomes the outer message
+            ctx = outer;
+            SHA256_Transform(&ctx, block);
+            sha256StateBytes(ctx, u);
+            for (size_t k = 0; k < sizeof(t); k++) t[k] ^= u[k];
+        }
+
+        const size_t n = outLen < sizeof(t) ? outLen : sizeof(t);
+        memcpy(out, t, n);
+        out += n;
+        outLen -= n;
+    }
+
+    OPENSSL_cleanse(key, sizeof(key));
+    OPENSSL_cleanse(pad, sizeof(pad));
+    OPENSSL_cleanse(block, sizeof(block));
+    OPENSSL_cleanse(u, sizeof(u));
+    OPENSSL_cleanse(t, sizeof(t));
+    OPENSSL_cleanse(&inner, sizeof(inner));
+    OPENSSL_cleanse(&outer, sizeof(outer));
+    OPENSSL_cleanse(&ctx, sizeof(ctx));
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_io_horizontalsystems_monerokit_util_NativeCrypto_pbkdf2HmacSha256J(JNIEnv *env, jclass clazz,
+                                                                        jbyteArray password,
+                                                                        jbyteArray salt,
+                                                                        jint iterations,
+                                                                        jint keyLength) {
+    if (password == nullptr || salt == nullptr || iterations < 1 || keyLength < 1 ||
+        keyLength > 1024) {
+        return nullptr;
+    }
+    const jsize passLen = env->GetArrayLength(password);
+    const jsize saltLen = env->GetArrayLength(salt);
+    std::vector<unsigned char> pass(static_cast<size_t>(passLen) + 1);
+    std::vector<unsigned char> saltBytes(static_cast<size_t>(saltLen) + 1);
+    std::vector<unsigned char> key(static_cast<size_t>(keyLength));
+    env->GetByteArrayRegion(password, 0, passLen, reinterpret_cast<jbyte *>(pass.data()));
+    env->GetByteArrayRegion(salt, 0, saltLen, reinterpret_cast<jbyte *>(saltBytes.data()));
+
+    pbkdf2HmacSha256(pass.data(), static_cast<size_t>(passLen),
+                     saltBytes.data(), static_cast<size_t>(saltLen),
+                     static_cast<uint32_t>(iterations), key.data(), key.size());
+    OPENSSL_cleanse(pass.data(), pass.size());
+
+    jbyteArray result = env->NewByteArray(keyLength);
+    if (result != nullptr) {
+        env->SetByteArrayRegion(result, 0, keyLength, reinterpret_cast<const jbyte *>(key.data()));
+    }
+    OPENSSL_cleanse(key.data(), key.size());
+    return result;
+}
+
 JNIEXPORT jstring JNICALL
 Java_io_horizontalsystems_monerokit_model_Wallet_getDisplayAmount(JNIEnv *env, jclass clazz,
                                                         jlong amount) {
