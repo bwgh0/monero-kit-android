@@ -87,6 +87,20 @@ inline void slow_hash_broken(const void *data, char *hash, int variant) {
     cn_slow_hash(data, 200 /*sizeof(union hash_state)*/, hash, variant, 1 /*prehashed*/,
                  0 /*height*/);
 }
+
+// from OpenSSL openssl/sha.h and openssl/crypto.h - libcrypto.a is linked, its headers are not shipped
+typedef struct SHA256state_st {
+    unsigned int h[8];
+    unsigned int Nl, Nh;
+    unsigned int data[16];
+    unsigned int num, md_len;
+} SHA256_CTX;
+
+int SHA256_Init(SHA256_CTX *c);
+int SHA256_Update(SHA256_CTX *c, const void *data, size_t len);
+int SHA256_Final(unsigned char *md, SHA256_CTX *c);
+void SHA256_Transform(SHA256_CTX *c, const unsigned char *data);
+void OPENSSL_cleanse(void *ptr, size_t len);
 #ifdef __cplusplus
 }
 #endif
