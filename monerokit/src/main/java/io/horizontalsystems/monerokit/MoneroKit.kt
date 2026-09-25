@@ -100,6 +100,10 @@ class MoneroKit(
     // soon as it begins. Cleared when a start ends without starting, and when stop() is done.
     @Volatile
     private var stopRequested = false
+
+    // Set by release(): the caller has dropped this instance, so it never starts again.
+    @Volatile
+    private var released = false
     private var savingState = AtomicBoolean(false)
     private var synced = false
     private var lastStoreHeight: Long = 0
@@ -161,7 +165,7 @@ class MoneroKit(
 
     suspend fun start() {
         startStopMutex.withLock {
-            if (started) return
+            if (started || released) return
 
             _syncStateFlow.update {
                 SyncState.Connecting(true)
@@ -208,6 +212,18 @@ class MoneroKit(
                 stopRequested = false
             }
         }
+    }
+
+    /**
+     * The caller drops this instance and stops it next: no start() runs on it again. A start that queued
+     * behind that stop (an app resume that picked up this kit just before its release) would otherwise
+     * reopen the wallet once the stop is done and keep KitManager's running slot, and the next kit would
+     * wait for that slot for good. Scans this process's sockets (see [abandonStart]): keep it off the
+     * main thread.
+     */
+    fun release() {
+        released = true
+        abandonStart()
     }
 
     /**
