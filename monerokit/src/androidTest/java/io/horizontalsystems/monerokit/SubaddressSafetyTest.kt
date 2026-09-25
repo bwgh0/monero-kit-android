@@ -3,6 +3,9 @@ package io.horizontalsystems.monerokit
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import io.horizontalsystems.hdwalletkit.Mnemonic
+import io.horizontalsystems.monerokit.data.TxData
+import io.horizontalsystems.monerokit.model.PendingTransaction
+import io.horizontalsystems.monerokit.model.Wallet
 import io.horizontalsystems.monerokit.model.WalletManager
 import io.horizontalsystems.monerokit.util.Helper
 import kotlinx.coroutines.flow.first
@@ -20,7 +23,12 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import timber.log.Timber
 import java.io.File
+import java.net.ServerSocket
+import java.net.Socket
 import java.util.UUID
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -108,8 +116,13 @@ class SubaddressSafetyTest {
         assertNull(kit.openWalletPrimaryAddress())
         assertNull(kit.addSubaddress())
         assertEquals(listOf(0), kit.getSubaddresses().map { it.addressIndex })
+
+        // Nothing was scanned, so nothing was stored: the adds and the close left the keys file only. A
+        // cache at height 1 would open as a new wallet and scan from the chain tip.
         assertTrue(WalletClosings.await(walletId, CLOSE_WAIT_MS))
-        assertEquals(7, subaddressCountOnDisk(walletId))
+        assertFalse(cacheFile(walletId).exists())
+        assertTrue(keysFile(walletId).exists())
+        assertEquals(1, subaddressCountOnDisk(walletId))
     }
 
     @Test
@@ -129,23 +142,77 @@ class SubaddressSafetyTest {
     }
 
     @Test
-    fun startCreatesTheRequiredSubaddresses() {
+    fun startCreatesTheRequiredSubaddressesBeforeItContactsTheNode() {
+        SilentNode().use { node ->
+            val walletId = newWalletId()
+            val kit = newKit(newSeed(), walletId, node.address)
+            kit.requiredSubaddressCount = 5
+            val starter = thread(name = "starter") { runBlocking { kit.start() } }
+
+            // The start opens the wallet, creates indices 1 to 4, then waits on the node's connection check.
+            val deadline = System.currentTimeMillis() + 20_000
+            while (!(kit.isWalletOpen && kit.getSubaddresses().size == 5) && System.currentTimeMillis() < deadline) {
+                Thread.sleep(20)
+            }
+            assertEquals((0..4).toList(), kit.getSubaddresses().map { it.addressIndex })
+            assertTrue("never reached the node", node.awaitConnection(10_000))
+
+            // Abandoned mid-start: the connection is cut, and the start gives up well before the 15 s check.
+            val abandonedAt = System.currentTimeMillis()
+            kit.abandonStart()
+            starter.join(10_000)
+            assertFalse("start still running", starter.isAlive)
+            assertTrue(System.currentTimeMillis() - abandonedAt < 5_000)
+            assertFalse(kit.isStarted)
+            assertTrue(kit.syncStateFlow.value is SyncState.Connecting)
+
+            // Never scanned: the close stored no cache, so the next start creates them again.
+            runBlocking { kit.stop() }
+            assertTrue(WalletClosings.await(walletId, CLOSE_WAIT_MS))
+            assertFalse(cacheFile(walletId).exists())
+            assertTrue(keysFile(walletId).exists())
+        }
+    }
+
+    @Test
+    fun feeEstimateBeforeInitThrowsInsteadOfAborting() {
+        val seed = newSeed()
         val walletId = newWalletId()
-        val kit = newKit(newSeed(), walletId)
-        kit.requiredSubaddressCount = 5
+        createWalletFiles(seed, walletId)
+        val service = WalletService(context)
+        val wallet = service.openWallet(walletId, "")
+        assertNotNull(wallet)
+        val kit = MoneroKit(context, seed, restoreHeight, walletId, service, DEAD_NODE, false)
+        val address = kit.seedPrimaryAddress()
 
-        // Opens the wallet, creates indices 1 to 4, then fails at the node and closes the wallet.
-        runBlocking { kit.start() }
-        assertFalse(kit.isStarted)
-        assertTrue(WalletClosings.await(walletId, CLOSE_WAIT_MS))
-        assertEquals(5, subaddressCountOnDisk(walletId))
+        // The kit refuses before start() has initialised the wallet for a node.
+        val refused = runCatching { kit.estimateFee(1_000_000L, address, null) }.exceptionOrNull()
+        assertTrue("got $refused", refused is IllegalStateException)
+        assertEquals("Wallet is not connected", refused?.message)
 
-        // Enough already: a second start adds nothing.
-        runBlocking { kit.stop() }
-        kit.requiredSubaddressCount = 3
-        runBlocking { kit.start() }
+        // Called directly, wallet2 throws for its fork rules: JNI hands that over as a Java exception.
+        val txData = TxData().apply {
+            setDestination(address)
+            setAmount(1_000_000L)
+            mixin = 0
+            priority = PendingTransaction.Priority.Priority_Medium
+        }
+        val notInitialised = runCatching { wallet!!.estimateTransactionFee(txData) }.exceptionOrNull()
+        assertTrue("got $notInitialised", notInitialised is IllegalStateException)
+        wallet!!.setOffline(true)
+        val offline = runCatching { wallet.estimateTransactionFee(txData) }.exceptionOrNull()
+        assertTrue("got $offline", offline is IllegalStateException)
+        wallet.setOffline(false)
+
+        // wallet2's connection check throws for a wallet never initialised: JNI reports it disconnected.
+        assertEquals(Wallet.ConnectionStatus.ConnectionStatus_Disconnected, wallet.connectionStatus)
+
+        // A send is refused the same way, before wallet2 would start refresh for it.
+        val send = runCatching { kit.send(1_000_000L, address, null) }.exceptionOrNull()
+        assertEquals("Wallet is not connected", send?.message)
+
+        service.stop()
         assertTrue(WalletClosings.await(walletId, CLOSE_WAIT_MS))
-        assertEquals(5, subaddressCountOnDisk(walletId))
     }
 
     @Test
@@ -287,6 +354,31 @@ class SubaddressSafetyTest {
         )
     }
 
+    @Test
+    fun heightOneCacheScansFromTheRestoreHeight() {
+        val node = InstrumentationRegistry.getArguments().getString("moneroNode")
+        assumeTrue("needs -e moneroNode host:port", !node.isNullOrEmpty())
+
+        // What older builds could leave behind: a cache stored before the first scan.
+        val seed = newSeed()
+        val walletId = newWalletId()
+        createWalletFiles(seed, walletId)
+        val raw = WalletManager.getInstance().openWallet(Helper.getWalletFile(context, walletId).absolutePath, "")
+        assertTrue(raw.status.errorString, raw.status.isOk)
+        assertEquals(1L, raw.blockChainHeight)
+        assertTrue(raw.store())
+        raw.close()
+        assertTrue(cacheFile(walletId).exists())
+
+        // wallet2 opens it as a new wallet, and its init() moves the scan start to the chain tip.
+        val scanFrom = restoreHeight - SCAN_BLOCKS
+        val service = WalletService(context)
+        val kit = MoneroKit(context, seed, scanFrom, walletId, service, node!!, false).also { kits += it }
+        runBlocking { kit.start() }
+        assertTrue("start failed: ${kit.syncStateFlow.value.description}", kit.isStarted)
+        assertEquals(scanFrom, service.wallet?.restoreHeight)
+    }
+
     private fun newSeed(): Seed.Electrum =
         Seed.Bip39(Mnemonic().generate(Mnemonic.EntropyStrength.VeryHigh), "").toElectrum()
 
@@ -305,6 +397,10 @@ class SubaddressSafetyTest {
         file.delete()
     }
 
+    private fun cacheFile(walletId: String) = File(Helper.getWalletRoot(context), walletId)
+
+    private fun keysFile(walletId: String) = File(Helper.getWalletRoot(context), "$walletId.keys")
+
     private fun subaddressCountOnDisk(walletId: String): Int {
         val wallet = WalletManager.getInstance().openWallet(Helper.getWalletFile(context, walletId).absolutePath, "")
         try {
@@ -313,5 +409,35 @@ class SubaddressSafetyTest {
         } finally {
             wallet.close()
         }
+    }
+}
+
+/**
+ * A node that accepts connections and never answers, so a start waits in wallet2's connection check. Binds
+ * every local address: "localhost" may resolve to either loopback family.
+ */
+private class SilentNode : AutoCloseable {
+    private val server = ServerSocket(0)
+    private val accepted = CopyOnWriteArrayList<Socket>()
+    private val connected = CountDownLatch(1)
+    private val acceptor = thread(name = "silent-node") {
+        try {
+            while (true) {
+                accepted += server.accept()
+                connected.countDown()
+            }
+        } catch (_: Exception) {
+            // closed
+        }
+    }
+
+    val address = "localhost:${server.localPort}"
+
+    fun awaitConnection(timeoutMs: Long) = connected.await(timeoutMs, TimeUnit.MILLISECONDS)
+
+    override fun close() {
+        server.close()
+        accepted.forEach { runCatching { it.close() } }
+        acceptor.join(1_000)
     }
 }
