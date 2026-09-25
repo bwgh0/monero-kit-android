@@ -287,7 +287,7 @@ class MoneroKit(
                 return false
             }
 
-            val status = walletService.start(wallet, trustNode)
+            val status = walletService.start(wallet, trustNode, restoreHeight) { stopRequested }
 
             if (status == null || !status.isOk) {
                 // an abandoned start failed because its connection was cut, not because of the node
@@ -379,17 +379,14 @@ class MoneroKit(
         walletService.withWallet { wallet -> subaddressesOf(wallet) }
             ?: listOf(Subaddress(accountIndex, 0, seedPrimaryAddress(), ""))
 
-    // Indices 0 until numSubaddresses: the ones wallet2 has created.
+    // Indices 0 until numSubaddresses: the ones wallet2 has created. Reads no wallet2 table a scan changes:
+    // the count comes from WalletService, the addresses from the keys, and labels are "" (the kit writes no
+    // other label).
     private fun subaddressesOf(wallet: Wallet): List<Subaddress> {
         val received = receivedPerIndex(wallet)
-        val count = wallet.getNumSubaddresses(accountIndex)
+        val count = walletService.subaddressCount
         return List(count) { index ->
-            Subaddress(
-                accountIndex,
-                index,
-                wallet.getSubaddress(accountIndex, index),
-                wallet.getSubaddressLabel(accountIndex, index)
-            ).apply {
+            Subaddress(accountIndex, index, wallet.getSubaddress(accountIndex, index), "").apply {
                 received[index]?.let {
                     amount = it.amount
                     txsCount = it.txsCount
@@ -400,7 +397,7 @@ class MoneroKit(
 
     private fun unusedOrPrimaryAddress(wallet: Wallet): String {
         val received = receivedPerIndex(wallet)
-        val count = wallet.getNumSubaddresses(accountIndex)
+        val count = walletService.subaddressCount
         val unused = (count - 1 downTo 1).firstOrNull { received[it] == null } ?: 0
         return wallet.getSubaddress(accountIndex, unused)
     }
@@ -435,7 +432,9 @@ class MoneroKit(
      */
     fun getSubaddress(accountIndex: Int, subaddressIndex: Int): Subaddress? {
         if (accountIndex < 0 || subaddressIndex < 0) return null
-        walletService.withWallet { wallet -> wallet.getSubaddressObject(accountIndex, subaddressIndex) }?.let { return it }
+        walletService.withWallet { wallet ->
+            Subaddress(accountIndex, subaddressIndex, wallet.getSubaddress(accountIndex, subaddressIndex), "")
+        }?.let { return it }
         return when {
             seed !is Seed.WatchOnly ->
                 Subaddress(accountIndex, subaddressIndex, seedAddress(accountIndex, subaddressIndex), "")
@@ -500,13 +499,16 @@ class MoneroKit(
 
         val newWalletFile = File(walletFolder, walletId)
         val walletPassword = ""
+        // An unknown height is -1, which JNI hands wallet2 as 2^64 - 1: a wallet that never scans a block.
+        // 0 scans from the start.
+        val creationHeight = restoreHeight.coerceAtLeast(0)
         val success = when (seed) {
             is Seed.Bip39,
             is Seed.Electrum -> {
                 val electrum = checkNotNull(electrumSeed)
                 val offset = electrum.passphrase
                 val mnemonic = electrum.mnemonic.joinToString(" ")
-                val newWallet = WalletManager.getInstance().recoveryWallet(newWalletFile, walletPassword, mnemonic, offset, restoreHeight)
+                val newWallet = WalletManager.getInstance().recoveryWallet(newWalletFile, walletPassword, mnemonic, offset, creationHeight)
                 val success = checkAndCloseWallet(newWallet)
 
                 val walletFile = File(walletFolder, walletId)
@@ -520,7 +522,7 @@ class MoneroKit(
                     /* aFile = */ newWalletFile,
                     /* password = */ walletPassword,
                     /* language = */ "",
-                    /* restoreHeight = */ restoreHeight,
+                    /* restoreHeight = */ creationHeight,
                     /* addressString = */ seed.address,
                     /* viewKeyString = */ seed.viewPrivateKey,
                     /* spendKeyString = */ ""

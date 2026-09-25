@@ -266,6 +266,13 @@ jobject cpp2java(JNIEnv *env, const std::vector<std::string> &vector) {
     return result;
 }
 
+// A C++ exception that leaves a JNI function aborts the process. Raise a Java IllegalStateException
+// instead; the caller returns right after.
+void throwIllegalState(JNIEnv *env, const std::string &message) {
+    jclass illegalState = env->FindClass("java/lang/IllegalStateException");
+    if (illegalState != nullptr) env->ThrowNew(illegalState, message.c_str());
+}
+
 /// end helpers
 
 #ifdef __cplusplus
@@ -884,7 +891,13 @@ Java_io_horizontalsystems_monerokit_model_Wallet_getRestoreHeight(JNIEnv *env, j
 JNIEXPORT jint JNICALL
 Java_io_horizontalsystems_monerokit_model_Wallet_getConnectionStatusJ(JNIEnv *env, jobject instance) {
     Monero::Wallet *wallet = getHandle<Monero::Wallet>(env, instance);
-    return wallet->connected();
+    // wallet2's check_connection() throws for a wallet that was never initialised
+    try {
+        return wallet->connected();
+    } catch (const std::exception &e) {
+        LOGW("getConnectionStatus: %s", e.what());
+        return Monero::Wallet::ConnectionStatus_Disconnected;
+    }
 }
 
 JNIEXPORT void JNICALL
@@ -1537,7 +1550,16 @@ Java_io_horizontalsystems_monerokit_model_Wallet_estimateTransactionFee(JNIEnv *
 
     Monero::Wallet *wallet = getHandle<Monero::Wallet>(env, instance);
 
-    return static_cast<jlong>(wallet->estimateTransactionFee(destinations, _priority));
+    // The fork rules and the fee rate come from the node: wallet2 throws when it cannot get them
+    // (node unreachable, wallet offline or not initialised).
+    try {
+        return static_cast<jlong>(wallet->estimateTransactionFee(destinations, _priority));
+    } catch (const std::exception &e) {
+        throwIllegalState(env, std::string("Fee estimate failed: ") + e.what());
+    } catch (...) {
+        throwIllegalState(env, "Fee estimate failed");
+    }
+    return 0;
 }
 
 //virtual bool exportKeyImages(const std::string &filename) = 0;

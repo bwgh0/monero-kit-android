@@ -32,6 +32,8 @@ class WalletService(private val context: Context) {
         private const val QUIESCE_GRACE_MS = 750L
         // What stop() still waits after the cut for store + close before handing them to the background.
         private const val CLOSE_GRACE_MS = 2_000L
+        // How often an abandoned start cuts its node connection again.
+        private const val START_CUT_INTERVAL_MS = 250L
     }
 
     private var observer: Observer? = null
@@ -51,6 +53,7 @@ class WalletService(private val context: Context) {
      *
      * walletLock, read: a getter's whole JNI sequence on the published wallet (withWallet). Held for short
      *   reads only, never across an RPC, a quiesce or a store, so a getter on Main waits a few ms at most.
+     *   Getters read no subaddress table (see knownSubaddressCount): the scan grows it outside any lock.
      * walletLock, write: each change to the subaddress tables (one subaddress add), and once by the close
      *   thread as a barrier: getters that read the wallet before it was unpublished finish first.
      * sessionLock: everything that brings refresh to rest or waits on the node: a store, a subaddress add,
@@ -68,6 +71,16 @@ class WalletService(private val context: Context) {
     // The wallet whose refresh start() started. Only that wallet is brought to rest for a store or an add.
     @Volatile
     private var refreshingWallet: Wallet? = null
+
+    // Account 0's subaddress count, read where nothing else changes wallet2's subaddress tables: at the
+    // open, after an add, after a quiesce, and on the refresh thread itself. Getters use it instead of
+    // wallet2's table, which a scan resizes when a payment arrives on a later subaddress.
+    @Volatile
+    private var knownSubaddressCount = 1
+
+    /** Account 0's subaddress count for getters on the published wallet. */
+    internal val subaddressCount: Int
+        get() = knownSubaddressCount
 
     private var daemonHeight: Long = 0
     private var lastDaemonStatusUpdate: Long = 0
@@ -99,49 +112,78 @@ class WalletService(private val context: Context) {
     }
 
     // Runs [block] on the published wallet under sessionLock; null when no wallet is open.
-    private inline fun <T> withSession(block: (Wallet) -> T): T? = sessionLock.withLock {
-        val wallet = wallet ?: return null
-        block(wallet)
+    private inline fun <T> withSession(block: (Wallet) -> T): T? {
+        // No wallet: return now instead of waiting behind a close that holds the lock.
+        if (wallet == null) return null
+        return sessionLock.withLock {
+            val wallet = wallet ?: return null
+            block(wallet)
+        }
     }
 
-    fun start(wallet: Wallet, trustNode: Boolean): Status? {
+    /**
+     * Initialises [wallet] for the node set in WalletManager, checks the connection and starts refresh.
+     * [restoreHeight] is where a wallet that has not scanned yet starts its scan (see [initWallet]).
+     * Returns null, with the wallet closed, when [cancelled] turns true before refresh starts.
+     */
+    fun start(
+        wallet: Wallet,
+        trustNode: Boolean,
+        restoreHeight: Long? = null,
+        cancelled: () -> Boolean = { false }
+    ): Status? {
         Timber.d("start()")
+
+        // Known before the wait for sessionLock, so an abandon can cut the connection this start makes.
+        daemonAddress = WalletManager.getInstance().daemonAddress
 
         // A store or subaddress add in progress ends before refresh starts; later ones bring it to rest.
         val walletStatus = sessionLock.withLock {
+            if (cancelled()) return@withLock null
             synchronized(this) {
                 running = true
                 this.wallet = wallet
 
                 Timber.d("wallet address %s, restore height: %d", wallet.address, wallet.restoreHeight)
 
-                initWallet(wallet, trustNode)
-
-                val status = wallet.fullStatus
+                // One cut can miss: after it, wallet2's TLS autodetect reconnects in plain text on a new
+                // socket. While this start is abandoned, cut again until its node contact is over.
+                val cutter = cutWhile(cancelled)
+                val status = try {
+                    initWallet(wallet, trustNode, restoreHeight)
+                    wallet.fullStatus
+                } finally {
+                    cutter.interrupt()
+                }
                 Timber.tag("eee").e("+++++ initialized wallet status: $status")
 
-                if (status.isOk) {
-                    listener = MyWalletListener().apply { start() }
-                    refreshingWallet = wallet
+                when {
+                    // The connection check can outlast an abandon: refresh never starts for this start.
+                    cancelled() -> null
+                    status.isOk -> {
+                        listener = MyWalletListener().apply { start() }
+                        refreshingWallet = wallet
+                        status
+                    }
+                    else -> status
                 }
-                status
             }
         }
 
         // Not under sessionLock: the close that stop() starts needs it.
-        if (!walletStatus.isOk) stop()
+        if (walletStatus == null || !walletStatus.isOk) stop()
         return walletStatus
     }
 
     // For observer callbacks, which run on wallet2's refresh thread; other callers use storeWalletSafely().
     @Synchronized
     fun storeWallet() {
-        val success = wallet?.store()
+        val success = wallet?.let { storeCache(it) }
         Timber.d("Wallet stored: $success")
     }
 
     /** Stores from outside the refresh thread: holds the refresh thread at rest for the write, then resumes it. */
-    fun storeWalletSafely(): Boolean = withSession { wallet -> atRest(wallet) { storeOrWarn(wallet) } } ?: false
+    fun storeWalletSafely(): Boolean = withSession { wallet -> atRest(wallet) { storeCache(wallet) } } ?: false
 
     /**
      * Adds the next subaddress of [accountIndex] and stores the wallet. Returns it, or null when no wallet
@@ -150,13 +192,14 @@ class WalletService(private val context: Context) {
      */
     fun addSubaddress(accountIndex: Int, label: String): Subaddress? = withSession { wallet ->
         atRest(wallet) {
-            walletLock.write { addNext(wallet, accountIndex, label) }?.also { storeOrWarn(wallet) }
+            walletLock.write { addNext(wallet, accountIndex, label) }?.also { storeCache(wallet) }
         }
     }
 
     /**
-     * Adds subaddresses to [accountIndex] until it has [count] of them (indices 0 until count), then stores
-     * once. Stops between two adds when [cancelled] returns true, and then leaves the store to the close.
+     * Adds subaddresses to [accountIndex] until it has [count] of them (indices 0 until count). Stops between
+     * two adds when [cancelled] returns true. Stores nothing: it runs before the first scan, when a store
+     * must not happen (see [storeCache]), so each start adds them again until the first store after a scan.
      * Returns how many it added, or null when no wallet is open.
      */
     fun ensureSubaddresses(accountIndex: Int, count: Int, cancelled: () -> Boolean): Int? = withSession { wallet ->
@@ -170,7 +213,6 @@ class WalletService(private val context: Context) {
                 if (!more) break
                 added++
             }
-            if (added > 0 && !cancelled()) storeOrWarn(wallet)
             added
         }
     }
@@ -182,21 +224,29 @@ class WalletService(private val context: Context) {
         val before = wallet.getNumSubaddresses(accountIndex)
         wallet.addSubaddress(accountIndex, label)
         val count = wallet.getNumSubaddresses(accountIndex)
+        if (accountIndex == 0) knownSubaddressCount = count
         if (count <= before) {
             Timber.w("addSubaddress: account %d still has %d subaddress(es)", accountIndex, count)
             return null
         }
         val index = count - 1
-        return Subaddress(
-            accountIndex,
-            index,
-            wallet.getSubaddress(accountIndex, index),
-            wallet.getSubaddressLabel(accountIndex, index)
-        )
+        return Subaddress(accountIndex, index, wallet.getSubaddress(accountIndex, index), label)
     }
 
-    private fun storeOrWarn(wallet: Wallet): Boolean = wallet.store().also { stored ->
-        if (!stored) Timber.w("Wallet store failed: %s", wallet.status.errorString)
+    /**
+     * Writes the wallet cache, except before the wallet's first scan. wallet2 opens a cache at height 1 as
+     * a brand new wallet and scans it from the chain tip, so a restored wallet would never see its history.
+     * Before that scan the cache holds nothing to keep: the keys file has the restore height.
+     */
+    private fun storeCache(wallet: Wallet): Boolean {
+        val height = wallet.blockChainHeight
+        if (height <= 1) {
+            Timber.d("Wallet store skipped at height %d", height)
+            return false
+        }
+        return wallet.store().also { stored ->
+            if (!stored) Timber.w("Wallet store failed: %s", wallet.status.errorString)
+        }
     }
 
     /**
@@ -212,11 +262,17 @@ class WalletService(private val context: Context) {
             } finally {
                 rescue?.interrupt()
             }
+            // The scan may have added subaddresses; at rest, nothing else changes the table.
+            knownSubaddressCount = wallet.getNumSubaddresses(0)
             return block()
         } finally {
             quiescing = false
-            wallet.setOffline(false)
-            wallet.startRefresh()
+            // Unpublished meanwhile: the wallet is closing, and a resumed pass would make the close wait for
+            // its RPC. The close brings it to rest anyway.
+            if (this.wallet === wallet) {
+                wallet.setOffline(false)
+                wallet.startRefresh()
+            }
         }
     }
 
@@ -262,7 +318,7 @@ class WalletService(private val context: Context) {
                         // Barrier: getters that read the wallet before it was unpublished are done with it.
                         walletLock.write {}
                         try {
-                            closeWallet(closing)
+                            closeWallet(closing, daemon)
                         } finally {
                             quiescing = false
                             if (refreshingWallet === closing) refreshingWallet = null
@@ -285,14 +341,21 @@ class WalletService(private val context: Context) {
         running = false
     }
 
-    private fun closeWallet(closing: Wallet) {
+    private fun closeWallet(closing: Wallet, daemon: String?) {
         try {
             // Not under the monitor: a callback already inside onRefreshed() may still need it for
             // storeWallet(), and quiesceRefresh() waits for that callback's pass to end.
-            quiesceRefresh(closing)
+            // stop() cuts the node connection once, but the close can start later: after a store, an add or
+            // a send that resumed refresh just before the unpublish, whose new pass has an RPC in flight.
+            val rescue = daemon?.let { cutConnectionAfter(it, QUIESCE_GRACE_MS) }
+            try {
+                quiesceRefresh(closing)
+            } finally {
+                rescue?.interrupt()
+            }
             Timber.d("Storing wallet before close")
             try {
-                if (!closing.store()) Timber.w("Wallet store failed: %s", closing.status.errorString)
+                storeCache(closing)
             } catch (e: Exception) {
                 Timber.w(e, "Failed to store wallet before close")
             }
@@ -302,6 +365,17 @@ class WalletService(private val context: Context) {
             Timber.d("Wallet closed")
         } catch (e: Throwable) {
             Timber.e(e, "Closing wallet failed")
+        }
+    }
+
+    // Cuts the node connections every START_CUT_INTERVAL_MS while [cancelled] holds, until interrupted.
+    private fun cutWhile(cancelled: () -> Boolean): Thread = thread(name = "wallet-start-cut") {
+        try {
+            while (true) {
+                Thread.sleep(START_CUT_INTERVAL_MS)
+                if (cancelled()) cutNodeConnections()
+            }
+        } catch (_: InterruptedException) {
         }
     }
 
@@ -367,6 +441,7 @@ class WalletService(private val context: Context) {
                     Timber.e(err, "error in openWallet onInitialWalletState")
                     Unit
                 }
+                knownSubaddressCount = wallet.getNumSubaddresses(0)
                 synchronized(this) { this.wallet = wallet }
                 wallet
             }
@@ -376,10 +451,20 @@ class WalletService(private val context: Context) {
         }
     }
 
-    private fun initWallet(wallet: Wallet, trustNode: Boolean) {
-        daemonAddress = WalletManager.getInstance().daemonAddress
+    private fun initWallet(wallet: Wallet, trustNode: Boolean, restoreHeight: Long?) {
         Timber.d("Using daemon %s", daemonAddress)
         wallet.init(0)
+        // A cache stored before its first scan (height 1) opens as a brand new wallet, and init() then moves
+        // the scan start to the chain tip: the wallet would never see its history. Put the start back.
+        if (restoreHeight != null) {
+            val height = wallet.blockChainHeight
+            if (height <= 1) {
+                val from = restoreHeight.coerceAtLeast(0)
+                val initFrom = wallet.restoreHeight
+                if (initFrom != from) Timber.w("wallet at height %d: scan from %d, not %d", height, from, initFrom)
+                wallet.setRestoreHeight(from)
+            }
+        }
         wallet.setTrustedDaemon(trustNode)
         wallet.setProxy(NetCipherHelper.getProxy())
     }
@@ -426,6 +511,8 @@ class WalletService(private val context: Context) {
             // don't flood with an update for every block ...
             if (lastBlockTime < System.currentTimeMillis() - 2000) {
                 lastBlockTime = System.currentTimeMillis()
+                // On the thread that grows the subaddress table, so the read cannot race it.
+                knownSubaddressCount = wallet.getNumSubaddresses(0)
                 Timber.d("newBlock() @ %d with observer %s", height, observer)
                 if (observer != null) {
                     var fullRefresh = false
@@ -458,6 +545,7 @@ class WalletService(private val context: Context) {
                 Timber.w("refreshed() wallet is NULL")
                 return
             }
+            knownSubaddressCount = wallet.getNumSubaddresses(0)
 
             val walletFullStatus = wallet.fullStatus
             if (!walletFullStatus.isOk) {
@@ -476,12 +564,19 @@ class WalletService(private val context: Context) {
         }
     }
 
-    /** Fee of [txData] at the node's current rates. Throws when no wallet is open. */
-    fun estimateFee(txData: TxData): Long =
-        withSession { wallet -> wallet.estimateTransactionFee(txData) } ?: throw IllegalStateException("Wallet is NULL")
+    /**
+     * Fee of [txData] at the node's current rates. Throws when no wallet is open, before start() has
+     * initialised it for the node, and when the node does not answer.
+     */
+    fun estimateFee(txData: TxData): Long = withSession { wallet ->
+        // Before init wallet2 has no node for its fork rules and fee rate.
+        check(refreshingWallet === wallet) { "Wallet is not connected" }
+        wallet.estimateTransactionFee(txData)
+    } ?: throw IllegalStateException("Wallet is NULL")
 
     /** Creates and commits one transaction, both on the same wallet. */
     fun send(txData: TxData, notes: String?) {
+        if (wallet == null) throw IllegalStateException("Create Transaction failed: Wallet is NULL")
         sessionLock.withLock {
             createTransaction(txData)
             sendTransaction(notes)
@@ -489,10 +584,14 @@ class WalletService(private val context: Context) {
     }
 
     fun createTransaction(txData: TxData) {
+        // No wallet: fail now instead of waiting behind a close that holds the lock.
+        if (wallet == null) throw IllegalStateException("Create Transaction failed: Wallet is NULL")
         sessionLock.withLock {
             val wallet = wallet ?: run {
                 throw IllegalStateException("Create Transaction failed: Wallet is NULL")
             }
+            // Before init there is no node, and wallet2 would start refresh for a wallet start() has not set up.
+            check(refreshingWallet === wallet) { "Wallet is not connected" }
             Timber.d("CREATE TX for wallet: %s", wallet.name)
 
             wallet.disposePendingTransaction()
@@ -508,6 +607,7 @@ class WalletService(private val context: Context) {
     }
 
     fun sendTransaction(notes: String?) {
+        if (wallet == null) throw IllegalStateException("Send Transaction failed: Wallet is NULL")
         sessionLock.withLock {
             val wallet = wallet ?: run {
                 throw IllegalStateException("Send Transaction failed: Wallet is NULL")
