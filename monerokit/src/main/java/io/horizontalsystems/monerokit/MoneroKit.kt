@@ -93,14 +93,33 @@ class MoneroKit(
     private val kitId = UUID.randomUUID().toString()
     private val accountIndex = 0
     private val startStopMutex = Mutex()
+    @Volatile
     private var started = false
 
-    // Set by abandonStart() for the start in progress, which then gives up; the next start() clears it.
+    // Set by abandonStart(). A start in progress gives up, and a start that has not begun yet gives up as
+    // soon as it begins. Cleared when a start ends without starting, and when stop() is done.
     @Volatile
     private var stopRequested = false
     private var savingState = AtomicBoolean(false)
     private var synced = false
     private var lastStoreHeight: Long = 0
+
+    /**
+     * How many subaddresses account 0 must have before refresh starts: a value of N means indices 0 until
+     * N. start() creates the missing ones right after it opens the wallet file, while nothing scans yet, so
+     * a cache rebuilt from the seed gets back the subaddresses the user made. Set it before start().
+     */
+    @Volatile
+    var requiredSubaddressCount: Int = 0
+
+    // A BIP39 seed takes a PBKDF2 run to convert. getInstance() already converts it, so this is at most once.
+    private val electrumSeed: Seed.Electrum? by lazy {
+        if (seed is Seed.WatchOnly) null else seed.toElectrum()
+    }
+
+    private val seedPrimary: String by lazy {
+        if (seed is Seed.WatchOnly) seed.address else seedAddress(accountIndex, 0)
+    }
 
     private val _syncStateFlow = MutableStateFlow<SyncState>(SyncState.NotSynced(SyncError.NotStarted))
     val syncStateFlow = _syncStateFlow.asStateFlow()
@@ -116,18 +135,12 @@ class MoneroKit(
 
     private var nodeInfo: NodeInfo? = null
 
+    /**
+     * The newest subaddress (index 1 or above) that has received nothing, else the primary address. Before
+     * the wallet file is open: the primary address derived from the seed. Never creates a subaddress.
+     */
     val receiveAddress: String
-        get() {
-            val wallet = walletService.wallet
-            return if (wallet != null) {
-                val lastUnusedSubaddress = getSubaddresses(wallet).drop(1).lastOrNull { it.txsCount == 0L }
-                lastUnusedSubaddress?.address ?: walletService.wallet?.newSubaddress ?: ""
-            } else if (seed is Seed.WatchOnly) {
-                seed.address
-            } else {
-                getAddress(seed, accountIndex, 1)
-            }
-        }
+        get() = walletService.withWallet { wallet -> unusedOrPrimaryAddress(wallet) } ?: seedPrimaryAddress()
 
     val balance: Balance
         get() = _balanceFlow.value
@@ -135,6 +148,10 @@ class MoneroKit(
     /** False after a start that failed, was abandoned, or has not run yet. */
     val isStarted: Boolean
         get() = started
+
+    /** True while an open wallet2 wallet is published: from the file open in start() until stop() begins its close. */
+    val isWalletOpen: Boolean
+        get() = walletService.wallet != null
 
     val lastBlockHeight: Long?
         get() = if (walletService.getConnectionStatus() == ConnectionStatus_Connected)
@@ -145,24 +162,31 @@ class MoneroKit(
     suspend fun start() {
         startStopMutex.withLock {
             if (started) return
-            stopRequested = false
 
             _syncStateFlow.update {
                 SyncState.Connecting(true)
             }
 
-            var kitState = KitManager.checkAndGetInitialState(kitId)
+            try {
+                // Abandoned before it began: open nothing and contact no node. syncState stays Connecting.
+                if (stopRequested) return
 
-            while (kitState == KitState.Waiting && !stopRequested) {
-                delay(1000)
-                kitState = KitManager.checkAndGetState(kitId)
-            }
+                var kitState = KitManager.checkAndGetInitialState(kitId)
 
-            if (kitState == KitState.Running) {
-                _syncStateFlow.update {
-                    SyncState.Connecting(false)
+                while (kitState == KitState.Waiting && !stopRequested) {
+                    delay(1000)
+                    kitState = KitManager.checkAndGetState(kitId)
                 }
-                started = startInternal()
+
+                if (kitState == KitState.Running && !stopRequested) {
+                    _syncStateFlow.update {
+                        SyncState.Connecting(false)
+                    }
+                    started = startInternal()
+                }
+            } finally {
+                // The abandon is used up by this start, so a later start of this kit runs.
+                if (!started) stopRequested = false
             }
         }
     }
@@ -188,14 +212,15 @@ class MoneroKit(
 
     /**
      * The caller has moved on (another wallet tapped, the node changed) and this kit will be stopped: make
-     * a start in progress give up now. A start holds the mutex through wallet2's first contact with the
-     * node, a connection check that waits up to 20 s on a node that never answers, so that connection is
-     * cut. Scans this process's sockets: keep it off the main thread.
+     * its start give up now. A start holds the mutex through wallet2's first contact with the node, a
+     * connection check that waits up to 20 s on a node that never answers, so that connection is cut. A
+     * start that has not begun yet gives up as soon as it begins, before it opens the wallet. Scans this
+     * process's sockets: keep it off the main thread.
      */
     fun abandonStart() {
-        if (!startStopMutex.isLocked || started) return
+        if (started) return
         stopRequested = true
-        walletService.cutNodeConnections()
+        if (startStopMutex.isLocked) walletService.cutNodeConnections()
     }
 
     private suspend fun startInternal(): Boolean {
@@ -229,6 +254,9 @@ class MoneroKit(
                 walletService.stop()
                 return false
             }
+
+            ensureRequiredSubaddresses()
+
             if (stopRequested) {
                 walletService.stop()
                 return false
@@ -236,6 +264,12 @@ class MoneroKit(
 
             nodeInfo = selectedNode
             WalletManager.getInstance().setDaemon(selectedNode)
+
+            // An abandon during setDaemon() had no connection to cut: the service learns the node in start().
+            if (stopRequested) {
+                walletService.stop()
+                return false
+            }
 
             val status = walletService.start(wallet, trustNode)
 
@@ -255,6 +289,23 @@ class MoneroKit(
             // wallet", which the app treats as a damaged cache and rebuilds from the seed.
             walletService.stop()
             return false
+        }
+    }
+
+    /**
+     * Creates the subaddresses [requiredSubaddressCount] asks for. Runs after the wallet file opens and
+     * before refresh starts, so nothing scans while wallet2 adds them. Gives way to a stop between adds.
+     */
+    private fun ensureRequiredSubaddresses() {
+        val required = requiredSubaddressCount
+        // wallet2 always has index 0
+        if (required <= 1) return
+        try {
+            val added = walletService.ensureSubaddresses(accountIndex, required) { stopRequested } ?: return
+            if (added > 0) Timber.i("kit.start(%s): created %d subaddress(es) to reach %d", walletId, added, required)
+        } catch (e: Exception) {
+            // Not fatal: refresh still finds payments to them within wallet2's lookahead.
+            Timber.w(e, "kit.start(%s): could not create the required subaddresses", walletId)
         }
     }
 
@@ -290,8 +341,7 @@ class MoneroKit(
     ) {
         val txData = buildTxData(amount, address, memo, sweepAll)
 
-        walletService.createTransaction(txData)
-        walletService.sendTransaction(memo)
+        walletService.send(txData, memo)
     }
 
     fun estimateFee(
@@ -300,48 +350,100 @@ class MoneroKit(
         memo: String?,
         sweepAll: Boolean = false
     ): Long {
-        val wallet = walletService.wallet ?: throw IllegalStateException("Wallet is NULL")
         val txData = buildTxData(amount, address, memo, sweepAll)
 
-        return wallet.estimateTransactionFee(txData)
+        return walletService.estimateFee(txData)
     }
 
-    fun getSubaddresses(): List<Subaddress> {
-        val wallet = walletService.wallet
-        if (wallet == null) {
-            if (seed is Seed.WatchOnly) {
-                return listOf(Subaddress(0, 0, seed.address, ""))
+    /**
+     * Account 0's subaddresses, with list position equal to addressIndex, and what each one received.
+     * Before the wallet file is open: the primary address derived from the seed, index 0 only.
+     */
+    fun getSubaddresses(): List<Subaddress> =
+        walletService.withWallet { wallet -> subaddressesOf(wallet) }
+            ?: listOf(Subaddress(accountIndex, 0, seedPrimaryAddress(), ""))
+
+    // Indices 0 until numSubaddresses: the ones wallet2 has created.
+    private fun subaddressesOf(wallet: Wallet): List<Subaddress> {
+        val received = receivedPerIndex(wallet)
+        val count = wallet.getNumSubaddresses(accountIndex)
+        return List(count) { index ->
+            Subaddress(
+                accountIndex,
+                index,
+                wallet.getSubaddress(accountIndex, index),
+                wallet.getSubaddressLabel(accountIndex, index)
+            ).apply {
+                received[index]?.let {
+                    amount = it.amount
+                    txsCount = it.txsCount
+                }
             }
-            return generateSubaddresses(seed, accountIndex, 2)
         }
-
-        return getSubaddresses(wallet)
     }
 
-    private fun getSubaddresses(wallet: Wallet): List<Subaddress> {
-        val list = mutableListOf<Subaddress>()
-        for (i in 0..wallet.numSubaddresses) {
-            wallet.getSubaddressObject(i)?.let {
-                list.add(it)
-            }
+    private fun unusedOrPrimaryAddress(wallet: Wallet): String {
+        val received = receivedPerIndex(wallet)
+        val count = wallet.getNumSubaddresses(accountIndex)
+        val unused = (count - 1 downTo 1).firstOrNull { received[it] == null } ?: 0
+        return wallet.getSubaddress(accountIndex, unused)
+    }
+
+    private class Received(var amount: Long = 0, var txsCount: Long = 0)
+
+    // Incoming totals per address index, from one pass over the history (the history holds account 0 only).
+    private fun receivedPerIndex(wallet: Wallet): Map<Int, Received> {
+        val totals = HashMap<Int, Received>()
+        for (info in wallet.history.all) {
+            if (info == null || info.direction != TransactionInfo.Direction.Direction_In) continue
+            val total = totals.getOrPut(info.addressIndex) { Received() }
+            total.amount += info.amount
+            total.txsCount++
         }
-        return list
+        return totals
     }
 
-    fun createSubaddress(): String? {
-        val wallet = walletService.wallet ?: return null
-        wallet.addSubaddress(accountIndex, "")
-        return wallet.getLastSubaddress(accountIndex)
-    }
+    /**
+     * Creates the next subaddress of account 0 and stores the wallet. Refresh is brought to rest for the
+     * add, since wallet2's scan reads the table it changes. Returns the new subaddress (addressIndex is
+     * numSubaddresses - 1 after the add), or null when no wallet is open. Blocks: call it off Main.
+     */
+    fun addSubaddress(label: String = ""): Subaddress? = walletService.addSubaddress(accountIndex, label)
 
+    /** The address of a new subaddress, see [addSubaddress]. */
+    fun createSubaddress(): String? = addSubaddress()?.address
+
+    /**
+     * One subaddress. From the open wallet, else derived from the seed. A WatchOnly seed has only its
+     * primary address (account 0, index 0) before the wallet opens: other indices are null then.
+     */
     fun getSubaddress(accountIndex: Int, subaddressIndex: Int): Subaddress? {
-        return walletService.wallet?.getSubaddressObject(accountIndex, subaddressIndex)
+        if (accountIndex < 0 || subaddressIndex < 0) return null
+        walletService.withWallet { wallet -> wallet.getSubaddressObject(accountIndex, subaddressIndex) }?.let { return it }
+        return when {
+            seed !is Seed.WatchOnly ->
+                Subaddress(accountIndex, subaddressIndex, seedAddress(accountIndex, subaddressIndex), "")
+            accountIndex == 0 && subaddressIndex == 0 -> Subaddress(0, 0, seed.address, "")
+            else -> null
+        }
     }
 
-    fun getKeys(): Keys? {
-        val wallet = walletService.wallet ?: return null
+    /**
+     * The primary address derived from the seed with the static derivation (WatchOnly: the address it was
+     * made from). Depends on the seed alone, so it is the same before and after the wallet opens.
+     */
+    fun seedPrimaryAddress(): String = seedPrimary
 
-        return Keys(
+    /** wallet2's primary address (account 0, index 0) of the open wallet, or null when none is open. */
+    fun openWalletPrimaryAddress(): String? = walletService.withWallet { wallet -> wallet.getSubaddress(0, 0) }
+
+    private fun seedAddress(accountIndex: Int, addressIndex: Int): String {
+        val electrum = electrumSeed ?: throw IllegalStateException("A WatchOnly seed has no mnemonic")
+        return WalletManager.getAddress(electrum.mnemonic.joinToString(" "), electrum.passphrase, accountIndex, addressIndex)
+    }
+
+    fun getKeys(): Keys? = walletService.withWallet { wallet ->
+        Keys(
             privateSpendKey = wallet.secretSpendKey,
             publicSpendKey = wallet.publicSpendKey,
             privateViewKey = wallet.secretViewKey,
@@ -385,7 +487,7 @@ class MoneroKit(
         val success = when (seed) {
             is Seed.Bip39,
             is Seed.Electrum -> {
-                val electrum = seed.toElectrum()
+                val electrum = checkNotNull(electrumSeed)
                 val offset = electrum.passphrase
                 val mnemonic = electrum.mnemonic.joinToString(" ")
                 val newWallet = WalletManager.getInstance().recoveryWallet(newWalletFile, walletPassword, mnemonic, offset, restoreHeight)
@@ -529,11 +631,13 @@ class MoneroKit(
     fun statusInfo(): Map<String, Any> {
         val statusInfo = LinkedHashMap<String, Any>()
 
+        val (walletStatus, walletHeight) = walletService.withWallet { it.status to it.blockChainHeight } ?: (null to 0L)
+
         statusInfo["Node"] = nodeInfo?.name?.let { "$it (${if (trustNode) "trusted" else "untrusted"})" } ?: "NULL"
-        statusInfo["Wallet Status"] = walletService.wallet?.status ?: "NULL"
+        statusInfo["Wallet Status"] = walletStatus ?: "NULL"
         statusInfo["Sync State"] = _syncStateFlow.value.description
         statusInfo["Last Block Height"] = lastBlockHeight ?: 0L
-        statusInfo["Wallet Height"] = walletService.wallet?.blockChainHeight ?: 0L
+        statusInfo["Wallet Height"] = walletHeight
         statusInfo["Daemon Height"] = walletService.getDaemonHeight()
         statusInfo["Connection Status"] = walletService.getConnectionStatus()
         statusInfo["Kit started"] = started
@@ -577,12 +681,14 @@ class MoneroKit(
             node: String,
             trustNode: Boolean
         ): MoneroKit {
+            // The kit uses the Electrum form only: a BIP39 seed is converted (PBKDF2) once, here.
+            val kitSeed = if (seed is Seed.Bip39) seed.toElectrum() else seed
             val walletService = WalletService(context)
             val restoreHeight = getHeight(restoreDateOrHeight)
 
             NetCipherHelper.createInstance(context)
 
-            return MoneroKit(context, seed, restoreHeight, walletId, walletService, node, trustNode)
+            return MoneroKit(context, kitSeed, restoreHeight, walletId, walletService, node, trustNode)
         }
 
         fun validateAddress(address: String) {
@@ -620,20 +726,6 @@ class MoneroKit(
             val passphrase = electrumSeed.passphrase
 
             return WalletManager.getAddress(mnemonic, passphrase, accountIndex, addressIndex)
-        }
-
-        private fun generateSubaddresses(seed: Seed, accountIndex: Int, count: Int): List<Subaddress> {
-            val electrumSeed = seed.toElectrum()
-            val mnemonic = electrumSeed.mnemonic.joinToString(" ")
-            val passphrase = electrumSeed.passphrase
-
-            val subaddresses = mutableListOf<Subaddress>()
-            for (i in 0 until count) {
-                val address = WalletManager.getAddress(mnemonic, passphrase, accountIndex, i)
-                val subaddress = Subaddress(accountIndex, i, address, "")
-                subaddresses.add(subaddress)
-            }
-            return subaddresses
         }
 
         fun restoreHeightForNewWallet(): Long {
