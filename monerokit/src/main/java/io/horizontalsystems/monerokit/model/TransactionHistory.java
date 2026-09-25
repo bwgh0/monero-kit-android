@@ -56,7 +56,8 @@ public class TransactionHistory {
         return transactions;
     }
 
-    private List<TransactionInfo> transactions = new ArrayList<>();
+    // Replaced whole on wallet2's refresh thread and read on others: volatile publishes the new list safely.
+    private volatile List<TransactionInfo> transactions = new ArrayList<>();
 
     public void refreshWithNotes(Wallet wallet) {
         refresh();

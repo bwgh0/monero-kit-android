@@ -177,7 +177,8 @@ public class Wallet {
     private native String getAddressJ(int accountIndex, int addressIndex);
 
     public Subaddress getSubaddressObject(int accountIndex, int subAddressIndex) {
-        return new Subaddress(accountIndex, subAddressIndex, getSubaddress(subAddressIndex), getSubaddressLabel(subAddressIndex));
+        return new Subaddress(accountIndex, subAddressIndex,
+                getSubaddress(accountIndex, subAddressIndex), getSubaddressLabel(accountIndex, subAddressIndex));
     }
 
     public Subaddress getSubaddressObject(int subAddressIndex) {
