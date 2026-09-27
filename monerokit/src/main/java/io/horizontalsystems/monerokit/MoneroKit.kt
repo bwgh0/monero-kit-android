@@ -157,6 +157,11 @@ class MoneroKit(
     val isWalletOpen: Boolean
         get() = walletService.wallet != null
 
+    /** Last primary read from this kit's wallet file, even if node failure closed it afterward. */
+    @Volatile
+    var checkedWalletFilePrimaryAddress: String? = null
+        private set
+
     val lastBlockHeight: Long?
         get() = if (walletService.getConnectionStatus() == ConnectionStatus_Connected)
             walletService.getDaemonHeight()
@@ -240,6 +245,7 @@ class MoneroKit(
     }
 
     private suspend fun startInternal(): Boolean {
+        checkedWalletFilePrimaryAddress = null
         try {
             // A close of this same wallet may still be finishing in the background (WalletService.stop()).
             // A stop() arriving meanwhile must not queue behind that wait: the start gives way to it.
@@ -258,6 +264,9 @@ class MoneroKit(
                 _syncStateFlow.update { SyncState.NotSynced(SyncError.InvalidNode("Invalid wallet")) }
                 return false
             }
+
+            // Read local identity before any network operation can fail and close the file.
+            checkedWalletFilePrimaryAddress = walletService.withWallet { it.getSubaddress(0, 0) }
 
             val selectedNode = if (nodeInfo != null) {
                 nodeInfo
