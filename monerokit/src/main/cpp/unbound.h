@@ -630,7 +630,7 @@ int ub_ctx_zone_remove(struct ub_ctx* ctx, const char *zone_name);
  * Similar to local-data config statement.
  * @param ctx: context.  Is finalized by the routine.
  * @param data: the resource record in text format, for example
- *	"www.example.com IN A 127.0.0.1"
+ *	"www.example.com IN A <address>"
  * @return 0 if OK, else error.
  */
 int ub_ctx_data_add(struct ub_ctx* ctx, const char *data);
