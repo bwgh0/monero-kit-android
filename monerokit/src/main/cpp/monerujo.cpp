@@ -17,6 +17,7 @@
 #include <inttypes.h>
 #include "monerujo.h"
 #include "wallet2_api.h"
+#include "openalias_lookup.hpp"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -645,17 +646,42 @@ Java_io_horizontalsystems_monerokit_model_WalletManager_stopMining(JNIEnv *env, 
 
 JNIEXPORT jstring JNICALL
 Java_io_horizontalsystems_monerokit_model_WalletManager_resolveOpenAlias(JNIEnv *env, jobject instance,
-                                                               jstring address,
-                                                               jboolean dnssec_valid) {
+                                                                         jstring address,
+                                                                         jbooleanArray dnssec_valid) {
+    if (address == nullptr) return nullptr;
     const char *_address = env->GetStringUTFChars(address, nullptr);
     if (_address == nullptr) return nullptr;
-    bool _dnssec_valid = (bool) dnssec_valid;
-    std::string resolvedAlias =
-            Monero::WalletManagerFactory::getWalletManager()->resolveOpenAlias(
-                    std::string(_address),
-                    _dnssec_valid);
+    const std::string input(_address);
     env->ReleaseStringUTFChars(address, _address);
-    return env->NewStringUTF(resolvedAlias.c_str());
+    bool valid = false;
+    std::string resolved;
+    try {
+        resolved = Monero::WalletManagerFactory::getWalletManager()->resolveOpenAlias(input, valid);
+    } catch (...) {
+        resolved.clear();
+        valid = false;
+    }
+    if (dnssec_valid != nullptr && env->GetArrayLength(dnssec_valid) > 0) {
+        const jboolean flag = valid ? JNI_TRUE : JNI_FALSE;
+        env->SetBooleanArrayRegion(dnssec_valid, 0, 1, &flag);
+    }
+    return env->NewStringUTF(resolved.c_str());
+}
+
+JNIEXPORT jstring JNICALL
+Java_io_horizontalsystems_monerokit_model_OpenAlias_lookupTxt(JNIEnv *env, jclass clazz,
+                                                              jstring name,
+                                                              jint forwarder_port,
+                                                              jint timeout_ms) {
+    std::string input;
+    if (name != nullptr) {
+        const char *_name = env->GetStringUTFChars(name, nullptr);
+        if (_name == nullptr) return nullptr;
+        input = _name;
+        env->ReleaseStringUTFChars(name, _name);
+    }
+    const std::string json = openalias::lookup_txt_json(input, forwarder_port, timeout_ms);
+    return env->NewStringUTF(json.c_str());
 }
 
 JNIEXPORT jboolean JNICALL
