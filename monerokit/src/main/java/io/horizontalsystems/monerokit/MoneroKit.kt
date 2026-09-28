@@ -425,6 +425,9 @@ class MoneroKit(
         return totals
     }
 
+    /** Local transaction key, if this wallet originally sent the transaction. Call off Main. */
+    fun transactionKey(hash: String): String? = walletService.transactionKey(hash)
+
     /**
      * Creates the next subaddress of account 0 and stores the wallet. Refresh is brought to rest for the
      * add, since wallet2's scan reads the table it changes. Returns the new subaddress (addressIndex is

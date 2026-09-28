@@ -185,6 +185,11 @@ class WalletService(private val context: Context) {
     /** Stores from outside the refresh thread: holds the refresh thread at rest for the write, then resumes it. */
     fun storeWalletSafely(): Boolean = withSession { wallet -> atRest(wallet) { storeCache(wallet) } } ?: false
 
+    /** Read the transaction key while scans and wallet closing are excluded. */
+    fun transactionKey(hash: String): String? = withSession { wallet ->
+        atRest(wallet) { wallet.getTxKey(hash) }
+    }
+
     /**
      * Adds the next subaddress of [accountIndex] and stores the wallet. Returns it, or null when no wallet
      * is open. wallet2 inserts into the subaddress map that its refresh scan reads, with no lock, so refresh
