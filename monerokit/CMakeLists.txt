@@ -4,7 +4,8 @@ message(STATUS ABI_INFO  = ${ANDROID_ABI})
 set(CMAKE_VERBOSE_MAKEFILE ON)
 add_library( monerujo
              SHARED
-             src/main/cpp/monerujo.cpp )
+             src/main/cpp/monerujo.cpp
+             src/main/cpp/openalias_lookup.cpp )
 
 target_link_options(monerujo PRIVATE
     "-Wl,-z,max-page-size=16384"

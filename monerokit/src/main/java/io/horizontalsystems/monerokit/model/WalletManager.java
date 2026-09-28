@@ -226,7 +226,11 @@ public class WalletManager {
 
     public native boolean stopMining();
 
-    public native String resolveOpenAlias(String address, boolean dnssec_valid);
+    /**
+     * Resolves an OpenAlias name with the wallet2 resolver. Writes the DNSSEC
+     * flag into dnssecValid[0] when the array has room. Blocks with no time limit.
+     */
+    public native String resolveOpenAlias(String address, boolean[] dnssecValid);
 
     public native boolean setProxy(String address);
 
