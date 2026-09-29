@@ -870,6 +870,42 @@ Java_io_horizontalsystems_monerokit_model_Wallet_initJ(JNIEnv *env, jobject inst
     return static_cast<jboolean>(status);
 }
 
+JNIEXPORT jboolean JNICALL
+Java_io_horizontalsystems_monerokit_model_Wallet_initWithProxyJ(JNIEnv *env, jobject instance,
+                                             jstring daemon_address,
+                                             jlong upper_transaction_size_limit,
+                                             jstring daemon_username, jstring daemon_password, jstring proxy_address) {
+    const char *_daemon_address = env->GetStringUTFChars(daemon_address, nullptr);
+    if (_daemon_address == nullptr) return JNI_FALSE;
+    const char *_daemon_username = env->GetStringUTFChars(daemon_username, nullptr);
+    if (_daemon_username == nullptr) {
+        env->ReleaseStringUTFChars(daemon_address, _daemon_address);
+        return JNI_FALSE;
+    }
+    const char *_daemon_password = env->GetStringUTFChars(daemon_password, nullptr);
+    if (_daemon_password == nullptr) {
+        env->ReleaseStringUTFChars(daemon_address, _daemon_address);
+        env->ReleaseStringUTFChars(daemon_username, _daemon_username);
+        return JNI_FALSE;
+    }
+    const char *_proxy_address = env->GetStringUTFChars(proxy_address, nullptr);
+    if (_proxy_address == nullptr) {
+        env->ReleaseStringUTFChars(daemon_address, _daemon_address);
+        env->ReleaseStringUTFChars(daemon_username, _daemon_username);
+        env->ReleaseStringUTFChars(daemon_password, _daemon_password);
+        return JNI_FALSE;
+    }
+    Monero::Wallet *wallet = getHandle<Monero::Wallet>(env, instance);
+    bool status = wallet->init(_daemon_address, (uint64_t) upper_transaction_size_limit,
+                               _daemon_username,
+                               _daemon_password, false, false, _proxy_address);
+    env->ReleaseStringUTFChars(daemon_address, _daemon_address);
+    env->ReleaseStringUTFChars(daemon_username, _daemon_username);
+    env->ReleaseStringUTFChars(daemon_password, _daemon_password);
+    env->ReleaseStringUTFChars(proxy_address, _proxy_address);
+    return static_cast<jboolean>(status);
+}
+
 //    virtual bool createWatchOnly(const std::string &path, const std::string &password, const std::string &language) const = 0;
 
 JNIEXPORT void JNICALL

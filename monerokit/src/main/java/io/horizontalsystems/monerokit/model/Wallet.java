@@ -237,6 +237,17 @@ public class Wallet {
 
     private native boolean initJ(String daemon_address, long upper_transaction_size_limit, String daemon_username, String daemon_password);
 
+    /** The proxy is passed into wallet2 init, before its first daemon RPC. */
+    public boolean init(long upper_transaction_size_limit, String proxyAddress) {
+        WalletManager manager = WalletManager.getInstance();
+        return initWithProxyJ(manager.getDaemonAddress(), upper_transaction_size_limit,
+                manager.getDaemonUsername(), manager.getDaemonPassword(), proxyAddress);
+    }
+
+    private native boolean initWithProxyJ(String daemonAddress, long upperTransactionSizeLimit,
+                                         String username, String password, String proxyAddress);
+
+
 //    virtual bool createWatchOnly(const std::string &path, const std::string &password, const std::string &language) const = 0;
 //    virtual void setRefreshFromBlockHeight(uint64_t refresh_from_block_height) = 0;
 

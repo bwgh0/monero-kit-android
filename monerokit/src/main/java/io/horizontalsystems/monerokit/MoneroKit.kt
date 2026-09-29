@@ -87,7 +87,8 @@ class MoneroKit(
     private val walletId: String,
     private val walletService: WalletService,
     private val node: String,
-    private val trustNode: Boolean
+    private val trustNode: Boolean,
+    private val proxyAddress: String? = null
 ) : WalletService.Observer {
 
     private val kitId = UUID.randomUUID().toString()
@@ -271,7 +272,9 @@ class MoneroKit(
             val selectedNode = if (nodeInfo != null) {
                 nodeInfo
             } else {
-                NodeInfo.fromString(node)
+                // Behind a proxy the node name stays unresolved: the proxy resolves it, never the device.
+                // A caller that passes a proxy setting decides alone; NetCipher applies only without one.
+                NodeInfo.fromString(node, proxyAddress?.isNotEmpty() ?: NetCipherHelper.isTor())
             }
 
             if (selectedNode == null) {
@@ -698,9 +701,10 @@ class MoneroKit(
             restoreDateOrHeight: String,
             walletId: String,
             node: String,
-            trustNode: Boolean
+            trustNode: Boolean,
+            proxyAddress: String? = null
         ): MoneroKit {
-            return getInstance(context, seed.toElectrum(), restoreDateOrHeight, walletId, node, trustNode)
+            return getInstance(context, seed.toElectrum(), restoreDateOrHeight, walletId, node, trustNode, proxyAddress)
         }
 
         fun getInstance(
@@ -709,16 +713,17 @@ class MoneroKit(
             restoreDateOrHeight: String,
             walletId: String,
             node: String,
-            trustNode: Boolean
+            trustNode: Boolean,
+            proxyAddress: String? = null
         ): MoneroKit {
             // The kit uses the Electrum form only: a BIP39 seed is converted (PBKDF2) once, here.
             val kitSeed = if (seed is Seed.Bip39) seed.toElectrum() else seed
-            val walletService = WalletService(context)
+            val walletService = WalletService(context, proxyAddress)
             val restoreHeight = getHeight(restoreDateOrHeight)
 
             NetCipherHelper.createInstance(context)
 
-            return MoneroKit(context, kitSeed, restoreHeight, walletId, walletService, node, trustNode)
+            return MoneroKit(context, kitSeed, restoreHeight, walletId, walletService, node, trustNode, proxyAddress)
         }
 
         fun validateAddress(address: String) {

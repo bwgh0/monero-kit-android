@@ -22,7 +22,7 @@ import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
 import kotlin.concurrent.write
 
-class WalletService(private val context: Context) {
+class WalletService(private val context: Context, private val configuredProxy: String? = null) {
 
     companion object {
         var running: Boolean = false
@@ -39,9 +39,12 @@ class WalletService(private val context: Context) {
     private var observer: Observer? = null
     private var listener: MyWalletListener? = null
 
-    // The node wallet2 was initialised with (WalletManager.getDaemonAddress(): resolved ip:port).
+    // The peer wallet2 connects to: the node (WalletManager.getDaemonAddress(): resolved ip:port), or the
+    // numeric proxy address when a proxy is set. NodeSockets resolves it, so it is never a node name.
     @Volatile
     private var daemonAddress: String? = null
+    // The SOCKS proxy wallet2 is initialised with; empty for a direct connection.
+    private var activeProxy: String = ""
 
     // Set while quiesceRefresh() winds a pass down; its callbacks would report an interrupted pass as synced.
     @Volatile
@@ -135,7 +138,9 @@ class WalletService(private val context: Context) {
         Timber.d("start()")
 
         // Known before the wait for sessionLock, so an abandon can cut the connection this start makes.
-        daemonAddress = WalletManager.getInstance().daemonAddress
+        activeProxy = configuredProxy ?: NetCipherHelper.getProxy()
+        // Socket cancellation must target the actual peer, without resolving the node outside Tor.
+        daemonAddress = activeProxy.ifEmpty { WalletManager.getInstance().daemonAddress }
 
         // A store or subaddress add in progress ends before refresh starts; later ones bring it to rest.
         val walletStatus = sessionLock.withLock {
@@ -458,7 +463,7 @@ class WalletService(private val context: Context) {
 
     private fun initWallet(wallet: Wallet, trustNode: Boolean, restoreHeight: Long?) {
         Timber.d("Using daemon %s", daemonAddress)
-        wallet.init(0)
+        check(wallet.init(0, activeProxy)) { "Wallet connection initialization failed" }
         // A cache stored before its first scan (height 1) opens as a brand new wallet, and init() then moves
         // the scan start to the chain tip: the wallet would never see its history. Put the start back.
         if (restoreHeight != null) {
@@ -471,7 +476,6 @@ class WalletService(private val context: Context) {
             }
         }
         wallet.setTrustedDaemon(trustNode)
-        wallet.setProxy(NetCipherHelper.getProxy())
     }
 
     private fun updateDaemonState(wallet: Wallet, height: Long) {

@@ -72,6 +72,18 @@ public class NodeInfo extends Node {
         }
     }
 
+    public static NodeInfo fromString(String nodeString, boolean remoteDns) {
+        try {
+            return new NodeInfo(nodeString, remoteDns);
+        } catch (IllegalArgumentException ex) {
+            return null;
+        }
+    }
+
+    private NodeInfo(String nodeString, boolean remoteDns) {
+        super(nodeString, remoteDns);
+    }
+
     public NodeInfo(NodeInfo anotherNode) {
         super(anotherNode);
         overwriteWith(anotherNode);

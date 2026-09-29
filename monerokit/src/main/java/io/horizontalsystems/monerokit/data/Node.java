@@ -42,7 +42,7 @@ public class Node {
         final private String onion;
 
         public boolean isOnion() {
-            return onion != null;
+            return onion != null && OnionHelper.isOnionHost(onion);
         }
 
         public String getHostName() {
@@ -140,6 +140,11 @@ public class Node {
     }
 
     Node(String nodeString) {
+        this(nodeString, false);
+    }
+
+    /** Keep proxy destinations unresolved so DNS goes through Tor too. */
+    Node(String nodeString, boolean remoteDns) {
         if ((nodeString == null) || nodeString.isEmpty())
             throw new IllegalArgumentException("daemon is empty");
         String daemonAddress;
@@ -204,7 +209,12 @@ public class Node {
         this.name = name;
 
         try {
-            setHost(host);
+            if (remoteDns) {
+                this.host = host;
+                this.hostAddress = new Address(null, host);
+            } else {
+                setHost(host);
+            }
         } catch (UnknownHostException ex) {
             throw new IllegalArgumentException("cannot resolve host " + host);
         }
