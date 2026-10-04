@@ -511,11 +511,17 @@ class WalletService(private val context: Context, private val configuredProxy: S
         override fun unconfirmedMoneyReceived(txId: String, amount: Long) = Timber.d("unconfirmedMoneyReceived() $amount @ $txId")
 
         override fun newBlock(height: Long) {
+            // Each new block changes the height, the confirmations and maybe the unlocked balance, but brings
+            // no money event: without this, a synced wallet's refreshed() published nothing and they froze.
+            // Set even while quiescing, so the next pass publishes a block that an interrupted one added.
+            updated = true
             if (quiescing) return
             val wallet = wallet ?: run {
                 Timber.w("newBlock() wallet is NULL")
                 return
             }
+            // Synced: refreshed() at the end of this pass publishes the block, with its history refreshed.
+            if (wallet.isSynchronized) return
 
             // don't flood with an update for every block ...
             if (lastBlockTime < System.currentTimeMillis() - 2000) {
@@ -525,17 +531,14 @@ class WalletService(private val context: Context, private val configuredProxy: S
                 Timber.d("newBlock() @ %d with observer %s", height, observer)
                 if (observer != null) {
                     var fullRefresh = false
-                    updateDaemonState(wallet, if (wallet.isSynchronized) height else 0)
-                    if (!wallet.isSynchronized) {
-                        updated = true
-                        // we want to see our transactions as they come in
-                        wallet.refreshHistory()
-                        val txCount = wallet.getHistory().getCount()
-                        if (txCount > lastTxCount) {
-                            // update the transaction list only if we have more than before
-                            lastTxCount = txCount
-                            fullRefresh = true
-                        }
+                    updateDaemonState(wallet, 0)
+                    // we want to see our transactions as they come in
+                    wallet.refreshHistory()
+                    val txCount = wallet.getHistory().getCount()
+                    if (txCount > lastTxCount) {
+                        // update the transaction list only if we have more than before
+                        lastTxCount = txCount
+                        fullRefresh = true
                     }
                     observer?.onRefreshed(wallet, Status(), fullRefresh)
                 }
@@ -565,6 +568,7 @@ class WalletService(private val context: Context, private val configuredProxy: S
             wallet.setSynchronized() // TODO sometimes called even if sync is not complete
             if (updated) {
                 updateDaemonState(wallet, wallet.blockChainHeight)
+                Timber.d("refreshed() publishes height %d", daemonHeight)
                 wallet.refreshHistory()
                 if (observer != null) {
                     updated = !observer!!.onRefreshed(wallet, walletFullStatus, true)
