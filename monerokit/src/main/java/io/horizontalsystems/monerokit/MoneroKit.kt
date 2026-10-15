@@ -361,24 +361,28 @@ class MoneroKit(
         if (started) walletService.recycleConnection()
     }
 
+    /** [priority]: wallet2's fee priority. Default lets wallet2 pick (Low while the pool is quiet). */
     fun send(
         amount: Long,
         address: String,
         memo: String?,
-        sweepAll: Boolean = false
+        sweepAll: Boolean = false,
+        priority: PendingTransaction.Priority = PendingTransaction.Priority.Priority_Medium
     ) {
-        val txData = buildTxData(amount, address, memo, sweepAll)
+        val txData = buildTxData(amount, address, memo, sweepAll, priority)
 
         walletService.send(txData, memo)
     }
 
+    /** The fee of a transfer (or a sweep) at [priority]; estimate it at the priority it will be sent with. */
     fun estimateFee(
         amount: Long,
         address: String,
         memo: String?,
-        sweepAll: Boolean = false
+        sweepAll: Boolean = false,
+        priority: PendingTransaction.Priority = PendingTransaction.Priority.Priority_Medium
     ): Long {
-        val txData = buildTxData(amount, address, memo, sweepAll)
+        val txData = buildTxData(amount, address, memo, sweepAll, priority)
 
         return walletService.estimateFee(txData)
     }
@@ -485,12 +489,13 @@ class MoneroKit(
         amount: Long,
         destination: String,
         memo: String?,
-        sweepAll: Boolean = false
+        sweepAll: Boolean = false,
+        priority: PendingTransaction.Priority = PendingTransaction.Priority.Priority_Medium
     ) = TxData().apply {
         this.amount = if (sweepAll) Wallet.SWEEP_ALL else amount
         this.destination = destination
         mixin = MIXIN
-        priority = PendingTransaction.Priority.Priority_Medium
+        this.priority = priority
         if (!memo.isNullOrEmpty()) {
             userNotes = UserNotes(memo)
         }
