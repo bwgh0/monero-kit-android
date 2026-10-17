@@ -2005,6 +2005,22 @@ Java_io_horizontalsystems_monerokit_model_PendingTransaction_getFirstTxIdJ(JNIEn
         return nullptr;
 }
 
+// Every transaction's id, signed and not yet committed: wallet2 knows them before the broadcast.
+JNIEXPORT jobjectArray JNICALL
+Java_io_horizontalsystems_monerokit_model_PendingTransaction_getTxIdsJ(JNIEnv *env, jobject instance) {
+    Monero::PendingTransaction *tx = getHandle<Monero::PendingTransaction>(env, instance);
+    std::vector<std::string> txids = tx->txid();
+    jclass stringClass = env->FindClass("java/lang/String");
+    jobjectArray result = env->NewObjectArray(static_cast<jsize>(txids.size()), stringClass, nullptr);
+    for (size_t i = 0; i < txids.size(); i++) {
+        jstring id = env->NewStringUTF(txids[i].c_str());
+        env->SetObjectArrayElement(result, static_cast<jsize>(i), id);
+        env->DeleteLocalRef(id);
+    }
+    env->DeleteLocalRef(stringClass);
+    return result;
+}
+
 JNIEXPORT jlong JNICALL
 Java_io_horizontalsystems_monerokit_model_PendingTransaction_getTxCount(JNIEnv *env, jobject instance) {
     Monero::PendingTransaction *tx = getHandle<Monero::PendingTransaction>(env, instance);

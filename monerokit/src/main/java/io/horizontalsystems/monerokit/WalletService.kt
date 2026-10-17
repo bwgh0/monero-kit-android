@@ -587,12 +587,15 @@ class WalletService(private val context: Context, private val configuredProxy: S
         wallet.estimateTransactionFee(txData)
     } ?: throw IllegalStateException("Wallet is NULL")
 
-    /** Creates and commits one transaction, both on the same wallet. */
-    fun send(txData: TxData, notes: String?) {
+    /**
+     * Creates and commits one transaction, both on the same wallet. [beforeCommit] gets the signed
+     * transaction before its broadcast; when it throws, nothing is broadcast.
+     */
+    fun send(txData: TxData, notes: String?, beforeCommit: ((SignedTransaction) -> Unit)? = null): SignedTransaction {
         if (wallet == null) throw IllegalStateException("Create Transaction failed: Wallet is NULL")
-        sessionLock.withLock {
+        return sessionLock.withLock {
             createTransaction(txData)
-            sendTransaction(notes)
+            sendTransaction(notes, beforeCommit)
         }
     }
 
@@ -619,9 +622,14 @@ class WalletService(private val context: Context, private val configuredProxy: S
         }
     }
 
-    fun sendTransaction(notes: String?) {
+    /**
+     * Commits the pending transaction. [beforeCommit] gets it signed, with its txids, before the
+     * broadcast (a caller saves them first); when it throws, the transaction is dropped unsent.
+     * Throws [TransactionRejectedException] when the node refused it.
+     */
+    fun sendTransaction(notes: String?, beforeCommit: ((SignedTransaction) -> Unit)? = null): SignedTransaction {
         if (wallet == null) throw IllegalStateException("Send Transaction failed: Wallet is NULL")
-        sessionLock.withLock {
+        return sessionLock.withLock {
             val wallet = wallet ?: run {
                 throw IllegalStateException("Send Transaction failed: Wallet is NULL")
             }
@@ -637,6 +645,19 @@ class WalletService(private val context: Context, private val configuredProxy: S
                 throw IllegalStateException("Send Transaction failed: ${pendingTransaction.getErrorString()}")
             }
             val txId = pendingTransaction.getFirstTxId()
+            val signed = SignedTransaction(
+                txids = pendingTransaction.getTxIds().ifEmpty { listOf(txId) },
+                amount = pendingTransaction.amount,
+                fee = pendingTransaction.fee
+            )
+            if (beforeCommit != null) {
+                try {
+                    beforeCommit(signed)
+                } catch (e: Exception) {
+                    wallet.disposePendingTransaction()
+                    throw e
+                }
+            }
             val success = pendingTransaction.commit("", true)
 
             if (success) {
@@ -649,9 +670,12 @@ class WalletService(private val context: Context, private val configuredProxy: S
                 val rc = storeWalletSafely()
                 Timber.d("wallet stored: %s with rc=%b", wallet.name, rc)
                 listener?.updated = true
+                signed
             } else {
                 val error = pendingTransaction.getErrorString()
                 wallet.disposePendingTransaction()
+                // wallet2 (PendingTransactionImpl::commit): "transaction <id> was rejected by daemon with status: ...".
+                if ("was rejected by daemon" in error) throw TransactionRejectedException("Send Transaction failed: $error")
                 throw IllegalStateException("Send Transaction failed: $error")
             }
         }

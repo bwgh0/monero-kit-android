@@ -361,17 +361,24 @@ class MoneroKit(
         if (started) walletService.recycleConnection()
     }
 
-    /** [priority]: wallet2's fee priority. Default lets wallet2 pick (Low while the pool is quiet). */
+    /**
+     * [priority]: wallet2's fee priority. Default lets wallet2 pick (Low while the pool is quiet).
+     * [beforeCommit] gets the signed transaction and its txids before the broadcast, so a caller can
+     * save them first; when it throws, nothing is broadcast. Returns the transaction that went out.
+     * Throws [TransactionRejectedException] when the node refused it (nothing went out); any other
+     * broadcast error may have reached the network.
+     */
     fun send(
         amount: Long,
         address: String,
         memo: String?,
         sweepAll: Boolean = false,
-        priority: PendingTransaction.Priority = PendingTransaction.Priority.Priority_Medium
-    ) {
+        priority: PendingTransaction.Priority = PendingTransaction.Priority.Priority_Medium,
+        beforeCommit: ((SignedTransaction) -> Unit)? = null
+    ): SignedTransaction {
         val txData = buildTxData(amount, address, memo, sweepAll, priority)
 
-        walletService.send(txData, memo)
+        return walletService.send(txData, memo, beforeCommit)
     }
 
     /** The fee of a transfer (or a sweep) at [priority]; estimate it at the priority it will be sent with. */

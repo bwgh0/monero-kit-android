@@ -94,6 +94,14 @@ public class PendingTransaction {
 
     public native String getFirstTxIdJ();
 
+    /** Every transaction's id, oldest first. Known once signed, before {@link #commit}: a broadcast that times out keeps them. */
+    public java.util.List<String> getTxIds() {
+        String[] ids = getTxIdsJ();
+        return ids == null ? java.util.Collections.emptyList() : java.util.Arrays.asList(ids);
+    }
+
+    public native String[] getTxIdsJ();
+
     public native long getTxCount();
 
     @Getter
