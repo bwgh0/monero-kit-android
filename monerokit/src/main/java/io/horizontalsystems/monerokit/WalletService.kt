@@ -599,6 +599,39 @@ class WalletService(private val context: Context, private val configuredProxy: S
         }
     }
 
+    /**
+     * Builds and signs a transfer without broadcasting it, so a review shows what it really costs: wallet2's
+     * fee estimate counts one input, and a transfer pays for each input it spends. [sendPrepared] broadcasts
+     * this same transaction (one build, one fetch of ring members from the node). A new prepare, a send or
+     * the wallet's close drops it.
+     */
+    fun prepare(txData: TxData): SignedTransaction = sessionLock.withLock {
+        createTransaction(txData)
+        val pending = wallet?.pendingTransaction ?: throw IllegalStateException("Create Transaction failed: Wallet is NULL")
+        signedOf(pending)
+    }
+
+    /** The transaction [prepare] built for [prepared] still waits to go out. */
+    fun isPrepared(prepared: SignedTransaction): Boolean = withSession { wallet ->
+        wallet.pendingTransaction?.takeIf { it.status === PendingTransaction.Status.Status_Ok }?.getTxIds() == prepared.txids
+    } == true
+
+    /**
+     * Broadcasts the transaction [prepare] built for [prepared]. Throws [PreparedTransactionLostException]
+     * (nothing is broadcast) when it is gone: the wallet closed, or another build replaced it. [beforeCommit]
+     * as for [send].
+     */
+    fun sendPrepared(prepared: SignedTransaction, notes: String?, beforeCommit: ((SignedTransaction) -> Unit)? = null): SignedTransaction {
+        if (wallet == null) throw IllegalStateException("Send Transaction failed: Wallet is NULL")
+        return sessionLock.withLock {
+            if (!isPrepared(prepared)) throw PreparedTransactionLostException()
+            sendTransaction(notes, beforeCommit)
+        }
+    }
+
+    private fun signedOf(pending: PendingTransaction): SignedTransaction =
+        SignedTransaction(txids = pending.getTxIds().ifEmpty { listOf(pending.getFirstTxId()) }, amount = pending.amount, fee = pending.fee)
+
     fun createTransaction(txData: TxData) {
         // No wallet: fail now instead of waiting behind a close that holds the lock.
         if (wallet == null) throw IllegalStateException("Create Transaction failed: Wallet is NULL")
@@ -645,11 +678,7 @@ class WalletService(private val context: Context, private val configuredProxy: S
                 throw IllegalStateException("Send Transaction failed: ${pendingTransaction.getErrorString()}")
             }
             val txId = pendingTransaction.getFirstTxId()
-            val signed = SignedTransaction(
-                txids = pendingTransaction.getTxIds().ifEmpty { listOf(txId) },
-                amount = pendingTransaction.amount,
-                fee = pendingTransaction.fee
-            )
+            val signed = signedOf(pendingTransaction)
             if (beforeCommit != null) {
                 try {
                     beforeCommit(signed)

@@ -13,3 +13,9 @@ data class SignedTransaction(val txids: List<String>, val amount: Long, val fee:
  * broadcast failure (a timeout, a lost connection) may have reached the network.
  */
 class TransactionRejectedException(message: String) : IllegalStateException(message)
+
+/**
+ * The transaction a review built ([MoneroKit.prepareSend]) is gone: the wallet closed, or another build
+ * replaced it. Nothing went out; build it again. The message starts as a failed build's does.
+ */
+class PreparedTransactionLostException : IllegalStateException("Create Transaction failed: the transaction to send is gone; build it again")

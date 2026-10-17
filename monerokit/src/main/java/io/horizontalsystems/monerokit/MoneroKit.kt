@@ -381,6 +381,32 @@ class MoneroKit(
         return walletService.send(txData, memo, beforeCommit)
     }
 
+    /**
+     * Builds and signs a transfer as [send] would, without broadcasting it: the returned fee is what the
+     * transfer pays (wallet2's [estimateFee] counts one input). [sendPrepared] broadcasts this same
+     * transaction. A new prepare, a send or the wallet's close drops it. Throws when the build fails.
+     */
+    fun prepareSend(
+        amount: Long,
+        address: String,
+        memo: String?,
+        sweepAll: Boolean = false,
+        priority: PendingTransaction.Priority = PendingTransaction.Priority.Priority_Medium
+    ): SignedTransaction = walletService.prepare(buildTxData(amount, address, memo, sweepAll, priority))
+
+    /** The transaction [prepareSend] built for [prepared] still waits to go out. */
+    fun isPrepared(prepared: SignedTransaction): Boolean = walletService.isPrepared(prepared)
+
+    /**
+     * Broadcasts the transaction [prepareSend] built for [prepared], as [send] does. Throws
+     * [PreparedTransactionLostException] (nothing went out) when it is gone.
+     */
+    fun sendPrepared(
+        prepared: SignedTransaction,
+        memo: String?,
+        beforeCommit: ((SignedTransaction) -> Unit)? = null
+    ): SignedTransaction = walletService.sendPrepared(prepared, memo, beforeCommit)
+
     /** The fee of a transfer (or a sweep) at [priority]; estimate it at the priority it will be sent with. */
     fun estimateFee(
         amount: Long,
